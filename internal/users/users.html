@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="id">
+<meta charset="utf-8">
+<title>Pengguna</title>
+<p><a href="/">Beranda</a></p>
+<h1>Pengguna</h1>
+<table>
+	<tr><th>Username</th><th>Platform Admin</th><th>Password</th><th></th></tr>
+	{{range .}}
+	<tr>
+		<td>{{.Username}}</td>
+		<td>
+			<form method="post" action="/admin/users/{{.ID}}/admin">
+				<input type="hidden" name="admin" value="{{not .Admin}}">
+				{{if .Admin}}Ya <button>Cabut</button>{{else}}Tidak <button>Jadikan admin</button>{{end}}
+			</form>
+		</td>
+		<td>
+			<form method="post" action="/admin/users/{{.ID}}/password">
+				<input type="password" name="password" placeholder="Password baru" required>
+				<button>Ganti</button>
+			</form>
+		</td>
+		<td>
+			<form method="post" action="/admin/users/{{.ID}}/delete"><button>Hapus</button></form>
+		</td>
+	</tr>
+	{{end}}
+</table>
+<h2>Tambah pengguna</h2>
+<form method="post" action="/admin/users">
+	<input name="username" placeholder="Username" required>
+	<input type="password" name="password" placeholder="Password" required>
+	<label><input type="checkbox" name="admin"> Platform Admin</label>
+	<button>Tambah</button>
+</form>
+</html>

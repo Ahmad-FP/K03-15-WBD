@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="id">
+<meta charset="utf-8">
+<title>Masuk</title>
+<h1>Masuk</h1>
+{{with .}}<p>{{.}}</p>{{end}}
+<form method="post" action="/login">
+	<label>Username <input name="username" required autofocus></label>
+	<label>Password <input type="password" name="password" required></label>
+	<button>Masuk</button>
+</form>
+</html>

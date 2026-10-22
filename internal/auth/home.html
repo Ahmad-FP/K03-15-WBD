@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="id">
+<meta charset="utf-8">
+<title>Beranda</title>
+<p>Masuk sebagai {{.Username}}</p>
+{{if .Admin}}<p><a href="/admin/users">Kelola pengguna</a></p>{{end}}
+{{/* #WIP: Blocked (Database) */}}
+<form method="post" action="/logout"><button>Keluar</button></form>
+</html>
