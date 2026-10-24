@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Ahmad-FP/K03-15-WBD/internal/auth"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/authentication"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/db"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -48,6 +48,14 @@ func do(h http.Handler, method, path, sid string, form url.Values) *httptest.Res
 	return rec
 }
 
+func doJSON(h http.Handler, method, path, sid, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.AddCookie(&http.Cookie{Name: session.CookieName, Value: sid})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
 func cookie(rec *httptest.ResponseRecorder) *http.Cookie {
 	for _, c := range rec.Result().Cookies() {
 		if c.Name == session.CookieName {
@@ -71,7 +79,7 @@ func loggedIn(h http.Handler, sid string) bool {
 
 func addUser(t *testing.T, pool *pgxpool.Pool, username, password string) int64 {
 	var id int64
-	err := pool.QueryRow(context.Background(), "INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id", username, auth.Hash(password)).Scan(&id)
+	err := pool.QueryRow(context.Background(), "INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id", username, authentication.Hash(password)).Scan(&id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +240,7 @@ func TestUserManagement(t *testing.T) {
 	var id int64
 	var hash string
 	pool.QueryRow(ctx, "SELECT id, password_hash FROM users WHERE username = 'budi'").Scan(&id, &hash)
-	if hash == "rahasia" || !auth.Check(hash, "rahasia") {
+	if hash == "rahasia" || !authentication.Check(hash, "rahasia") {
 		t.Error("password not stored as a hash")
 	}
 	budi := login(t, h, "budi", "rahasia")
@@ -278,5 +286,33 @@ func TestPrivilegeChange(t *testing.T) {
 	do(h, "POST", path, admin, url.Values{"admin": {"false"}})
 	if loggedIn(h, budi) {
 		t.Error("demoted user still has a session")
+	}
+}
+
+func TestAccessGrantRotates(t *testing.T) {
+	h, pool := testServer(t)
+	ctx := context.Background()
+	admin := login(t, h, "admin", "admin")
+	id := addUser(t, pool, "budi", "rahasia")
+	budi := login(t, h, "budi", "rahasia")
+	pool.Exec(ctx, "INSERT INTO platform_groups (id, name) VALUES (1, 'dev')")
+	pool.Exec(ctx, "INSERT INTO managed_databases (id, name, encrypted_dsn) VALUES (1, 'target', '')")
+
+	steps := []struct {
+		name, method, path, body string
+		status                   int
+	}{
+		{"joining a group", "POST", "/api/groups/1/members", `{"user_id":` + strconv.FormatInt(id, 10) + `}`, http.StatusCreated},
+		{"access grant", "PUT", "/api/db/1/access/1", `{"access_level":"view_edit"}`, http.StatusNoContent},
+	}
+	for _, s := range steps {
+		if rec := doJSON(h, s.method, s.path, admin, s.body); rec.Code != s.status {
+			t.Fatalf("%s: status %d", s.name, rec.Code)
+		}
+		rec := do(h, "GET", "/", budi, nil)
+		if rec.Code != http.StatusOK || cookie(rec) == nil || cookie(rec).Value == budi {
+			t.Fatalf("%s did not rotate: status %d, cookie %v", s.name, rec.Code, cookie(rec))
+		}
+		budi = cookie(rec).Value
 	}
 }

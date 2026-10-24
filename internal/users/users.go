@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/Ahmad-FP/K03-15-WBD/internal/auth"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/authentication"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -36,7 +36,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	_, err := h.DB.Exec(r.Context(), "INSERT INTO users (username, password_hash, is_admin) VALUES ($1, $2, $3)",
-		r.FormValue("username"), auth.Hash(r.FormValue("password")), r.FormValue("admin") != "")
+		r.FormValue("username"), authentication.Hash(r.FormValue("password")), r.FormValue("admin") != "")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -45,7 +45,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) SetPassword(w http.ResponseWriter, r *http.Request) {
-	h.DB.Exec(r.Context(), "UPDATE users SET password_hash = $2 WHERE id = $1", userID(r), auth.Hash(r.FormValue("password")))
+	h.DB.Exec(r.Context(), "UPDATE users SET password_hash = $2 WHERE id = $1", userID(r), authentication.Hash(r.FormValue("password")))
 	http.Redirect(w, r, "/admin/users", http.StatusSeeOther)
 }
 

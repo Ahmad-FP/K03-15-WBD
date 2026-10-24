@@ -9,7 +9,7 @@ import (
 	"github.com/Ahmad-FP/K03-15-WBD/internal/access"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authentication"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authorization"
-	"github.com/Ahmad-FP/K03-15-WBD/internal/database"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/db"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/groups"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/users"
@@ -20,9 +20,9 @@ func newServer(pool *pgxpool.Pool) http.Handler {
 	sessions := &session.Store{DB: pool}
 	authHandler := &authentication.Handler{DB: pool, Sessions: sessions}
 	userHandler := &users.Handler{DB: pool, Sessions: sessions}
-	groupHandler := &groups.Handler{DB: pool}
-	databaseHandler := &database.Handler{DB: pool}
-	accessHandler := &access.Handler{DB: pool}
+	groupHandler := &groups.Handler{DB: pool, Sessions: sessions}
+	databaseHandler := &db.Handler{DB: pool}
+	accessHandler := &access.Handler{DB: pool, Sessions: sessions}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /login", authHandler.LoginPage)
@@ -80,7 +80,7 @@ func main() {
 	if err := pool.Ping(ctx); err != nil {
 		log.Fatal("gagal terhubung ke database aplikasi: ", err)
 	}
-	if _, err := pool.Exec(ctx, database.Schema); err != nil {
+	if _, err := pool.Exec(ctx, db.Schema); err != nil {
 		log.Fatal("gagal menyiapkan schema: ", err)
 	}
 	log.Fatal(http.ListenAndServe(":8080", newServer(pool)))

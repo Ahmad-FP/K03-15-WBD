@@ -7,10 +7,14 @@ import (
 	"strconv"
 
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authorization"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type Handler struct{ DB *pgxpool.Pool }
+type Handler struct {
+	DB       *pgxpool.Pool
+	Sessions *session.Store
+}
 type Grant struct {
 	GroupID     int64               `json:"group_id"`
 	GroupName   string              `json:"group_name"`
@@ -77,6 +81,7 @@ func (h *Handler) Set(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "akses tidak dapat ditetapkan; group atau database mungkin tidak ditemukan", 409)
 		return
 	}
+	h.Sessions.RotateGroup(r.Context(), groupID)
 	w.WriteHeader(http.StatusNoContent)
 }
 

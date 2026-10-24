@@ -7,4 +7,4 @@
 | Rotasi berkala | 15 menit |
 | Grace period ID lama | 60 detik |
 
-ID session dirotasi saat login, saat user dijadikan Platform Admin, dan setiap 15 menit. Rotasi tidak mengubah waktu login, jadi absolute expiration tetap dihitung dari login pertama.
+ID session rotasi kalau login, user dijadikan Platform Admin, user masuk group, akses group ke database diberikan atau berubah, dan tiap 15 menit. Absolute Expiration tidak terpengaruh.

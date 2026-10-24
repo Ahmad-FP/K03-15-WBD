@@ -8,11 +8,15 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type Handler struct{ DB *pgxpool.Pool }
+type Handler struct {
+	DB       *pgxpool.Pool
+	Sessions *session.Store
+}
 type Group struct {
 	ID          int64  `json:"id"`
 	Name        string `json:"name"`
@@ -160,6 +164,7 @@ func (h *Handler) AddMember(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "anggota tidak dapat ditambahkan; group/user mungkin tidak ada atau sudah menjadi anggota", 409)
 		return
 	}
+	h.Sessions.RotateUser(r.Context(), p.UserID)
 	w.WriteHeader(http.StatusCreated)
 }
 

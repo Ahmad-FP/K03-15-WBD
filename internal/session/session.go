@@ -12,7 +12,7 @@ import (
 const (
 	CookieName  = "session"
 	IdleTimeout = 30 * time.Minute
-	MaxAge      =24 * time.Hour
+	MaxAge      = 24 * time.Hour
 	RotateEvery = 15 * time.Minute
 	Grace       = 60 * time.Second
 )
@@ -47,6 +47,10 @@ func (s *Store) End(w http.ResponseWriter, r *http.Request) {
 
 func (s *Store) RotateUser(ctx context.Context, userID int64) {
 	s.DB.Exec(ctx, "UPDATE sessions SET rotated_at = 'epoch' WHERE user_id = $1", userID)
+}
+
+func (s *Store) RotateGroup(ctx context.Context, groupID int64) {
+	s.DB.Exec(ctx, "UPDATE sessions SET rotated_at = 'epoch' WHERE user_id IN (SELECT user_id FROM group_members WHERE group_id = $1)", groupID)
 }
 
 func (s *Store) RevokeUser(ctx context.Context, userID int64) {
