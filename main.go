@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/Ahmad-FP/K03-15-WBD/internal/auth"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/authentication"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/db"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/users"
