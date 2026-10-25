@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 
 	"github.com/Ahmad-FP/K03-15-WBD/internal/access"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authentication"
@@ -13,6 +14,7 @@ import (
 	"github.com/Ahmad-FP/K03-15-WBD/internal/groups"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/users"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/viewer"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -23,6 +25,7 @@ func newServer(pool *pgxpool.Pool) http.Handler {
 	groupHandler := &groups.Handler{DB: pool, Sessions: sessions}
 	databaseHandler := &db.Handler{DB: pool}
 	accessHandler := &access.Handler{DB: pool, Sessions: sessions}
+	viewerHandler := &viewer.Handler{DB: pool}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /login", authHandler.LoginPage)
@@ -37,6 +40,22 @@ func newServer(pool *pgxpool.Pool) http.Handler {
 			protected.ServeHTTP(w, r)
 		})
 	}
+
+	// cek session dulu, baru cek akses group ke database {id} di path
+	dbAccess := func(required authorization.Level, h http.HandlerFunc) http.Handler {
+		return sessions.Require(func(w http.ResponseWriter, r *http.Request) {
+			id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+			if err != nil || id <= 0 {
+				http.Error(w, "id tidak valid", http.StatusBadRequest)
+				return
+			}
+			authorization.RequireDatabaseAccess(pool, id, required, h).ServeHTTP(w, r)
+		})
+	}
+
+	mux.Handle("GET /databases", sessions.Require(viewerHandler.List))
+	mux.Handle("GET /databases/{id}", dbAccess(authorization.ViewOnly, viewerHandler.Overview))
+	mux.Handle("GET /databases/{id}/tables/{schema}/{table}", dbAccess(authorization.ViewOnly, viewerHandler.Table))
 
 	mux.Handle("GET /admin/users", admin(userHandler.List))
 	mux.Handle("POST /admin/users", admin(userHandler.Create))

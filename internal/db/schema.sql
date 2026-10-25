@@ -69,5 +69,5 @@ CREATE TABLE IF NOT EXISTS migrations (
     executed_at timestamptz,
     UNIQUE (database_id, version)
 );
-
+-- cuma boleh ada satu migration yang belum sukses per database, biar riwayatnya tetap linear
 CREATE UNIQUE INDEX IF NOT EXISTS idx_migrations_one_pending ON migrations(database_id) WHERE status <> 'success';
