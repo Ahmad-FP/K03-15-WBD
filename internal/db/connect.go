@@ -51,14 +51,19 @@ func Name(ctx context.Context, app *pgxpool.Pool, id int64) (string, error) {
 	return name, err
 }
 
-// ubah error koneksi jadi response yang ga bocorin detail credential
-func ConnectError(w http.ResponseWriter, err error) {
+// status dan pesan error koneksi yang ga bocorin detail credential
+func ConnectStatus(err error) (int, string) {
 	switch {
 	case errors.Is(err, ErrNotFound):
-		http.Error(w, err.Error(), http.StatusNotFound)
+		return http.StatusNotFound, err.Error()
 	case errors.Is(err, ErrUnreachable):
-		http.Error(w, "gagal terhubung ke database target, coba hubungi admin", http.StatusBadGateway)
-	default:
-		http.Error(w, "terjadi kesalahan saat membuka database target", http.StatusInternalServerError)
+		return http.StatusBadGateway, "gagal terhubung ke database target, coba hubungi admin"
 	}
+	return http.StatusInternalServerError, "terjadi kesalahan saat membuka database target"
+}
+
+// tulis error koneksi sebagai response polos
+func ConnectError(w http.ResponseWriter, err error) {
+	status, msg := ConnectStatus(err)
+	http.Error(w, msg, status)
 }

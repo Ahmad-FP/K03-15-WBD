@@ -171,6 +171,9 @@ func TestViewerConnectionFailure(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "rahasiaDB") {
 		t.Error("password database target bocor di response")
 	}
+	if !strings.Contains(rec.Body.String(), dbPath(id)+"/migrations") {
+		t.Error("link riwayat migration hilang waktu koneksi gagal")
+	}
 }
 
 func TestViewerData(t *testing.T) {

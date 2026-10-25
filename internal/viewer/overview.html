@@ -6,6 +6,7 @@
 <h1>{{.Name}}</h1>
 <p>Akses: {{if .CanEdit}}View + Edit{{else}}View Only{{end}}</p>
 <p><a href="/databases/{{.ID}}/migrations">Riwayat migration</a>{{if .CanEdit}} | <a href="/databases/{{.ID}}/migrations/new">Buat migration</a>{{end}}</p>
+{{with .Alert}}<p><strong>{{.}}</strong></p>{{else}}
 <h2>Schema</h2>
 {{$id := .ID}}
 {{range .Schemas}}
@@ -19,6 +20,7 @@
 </ul>
 {{else}}
 <p>Schema kosong.</p>
+{{end}}
 {{end}}
 {{end}}
 </html>

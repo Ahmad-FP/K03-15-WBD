@@ -1,6 +1,7 @@
 package viewer
 
 import (
+	"context"
 	"embed"
 	"errors"
 	"html/template"
@@ -37,6 +38,7 @@ type page struct {
 	ID      int64
 	Name    string
 	CanEdit bool
+	Alert   string
 }
 
 // daftar database yang bisa dibuka user lewat group-nya
@@ -80,15 +82,17 @@ func (h *Handler) Overview(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	tx, done, ok := h.readOnly(w, r, p.ID)
-	if !ok {
-		return
+	var schemas []schemaInfo
+	tx, done, err := h.open(r.Context(), p.ID)
+	if err == nil {
+		defer done()
+		schemas, err = listSchemas(r.Context(), tx)
 	}
-	defer done()
-	schemas, err := listSchemas(r.Context(), tx)
+	// target mati tetap tampilin halaman, riwayat migration kan ada di database platform
 	if err != nil {
-		http.Error(w, "gagal membaca schema database target", http.StatusBadGateway)
-		return
+		var status int
+		status, p.Alert = db.ConnectStatus(err)
+		w.WriteHeader(status)
 	}
 	tmpl.ExecuteTemplate(w, "overview.html", struct {
 		page
@@ -162,12 +166,10 @@ func (h *Handler) page(w http.ResponseWriter, r *http.Request) (page, bool) {
 }
 
 // buka transaksi read-only ke database target, viewer ga boleh ngubah apa-apa
-func (h *Handler) readOnly(w http.ResponseWriter, r *http.Request, id int64) (pgx.Tx, func(), bool) {
-	ctx := r.Context()
+func (h *Handler) open(ctx context.Context, id int64) (pgx.Tx, func(), error) {
 	conn, err := db.Connect(ctx, h.DB, id)
 	if err != nil {
-		db.ConnectError(w, err)
-		return nil, nil, false
+		return nil, nil, err
 	}
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err == nil {
@@ -175,11 +177,20 @@ func (h *Handler) readOnly(w http.ResponseWriter, r *http.Request, id int64) (pg
 	}
 	if err != nil {
 		conn.Close(ctx)
-		http.Error(w, "gagal membuka transaksi di database target", http.StatusBadGateway)
-		return nil, nil, false
+		return nil, nil, db.ErrUnreachable
 	}
 	return tx, func() {
 		tx.Rollback(ctx)
 		conn.Close(ctx)
-	}, true
+	}, nil
+}
+
+// sama kayak open, tapi langsung nulis response error kalau gagal
+func (h *Handler) readOnly(w http.ResponseWriter, r *http.Request, id int64) (pgx.Tx, func(), bool) {
+	tx, done, err := h.open(r.Context(), id)
+	if err != nil {
+		db.ConnectError(w, err)
+		return nil, nil, false
+	}
+	return tx, done, true
 }
