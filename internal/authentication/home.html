@@ -3,7 +3,7 @@
 <meta charset="utf-8">
 <title>Beranda</title>
 <p>Masuk sebagai {{.Username}}</p>
-{{if .Admin}}<p><a href="/admin/users">Kelola pengguna</a></p>{{end}}
+{{if .Admin}}<p><a href="/admin/users">Kelola pengguna</a> | <a href="/admin/groups">Kelola group</a> | <a href="/admin/databases">Kelola koneksi database</a></p>{{end}}
 <p><a href="/databases">Database saya</a></p>
 <form method="post" action="/logout"><button>Keluar</button></form>
 </html>

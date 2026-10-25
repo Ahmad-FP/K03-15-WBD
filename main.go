@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/Ahmad-FP/K03-15-WBD/internal/access"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/admin"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authentication"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authorization"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/db"
@@ -28,6 +29,7 @@ func newServer(pool *pgxpool.Pool) http.Handler {
 	accessHandler := &access.Handler{DB: pool, Sessions: sessions}
 	viewerHandler := &viewer.Handler{DB: pool}
 	migrationHandler := &migration.Handler{DB: pool}
+	adminPages := &admin.Handler{DB: pool}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /login", authHandler.LoginPage)
@@ -67,6 +69,8 @@ func newServer(pool *pgxpool.Pool) http.Handler {
 	mux.Handle("POST /databases/{id}/migrations/{mid}/delete", dbAccess(authorization.ViewEdit, migrationHandler.Delete))
 	mux.Handle("POST /databases/{id}/migrations/{mid}/run", dbAccess(authorization.ViewEdit, migrationHandler.Run))
 
+	mux.Handle("GET /admin/groups", admin(adminPages.Groups))
+	mux.Handle("GET /admin/databases", admin(adminPages.Databases))
 	mux.Handle("GET /admin/users", admin(userHandler.List))
 	mux.Handle("POST /admin/users", admin(userHandler.Create))
 	mux.Handle("POST /admin/users/{id}/password", admin(userHandler.SetPassword))

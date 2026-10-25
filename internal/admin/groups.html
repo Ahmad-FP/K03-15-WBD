@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="id">
+<meta charset="utf-8">
+<title>Group</title>
+<p><a href="/">Beranda</a> | <a href="/admin/users">Pengguna</a> | <a href="/admin/databases">Database</a></p>
+<h1>Group</h1>
+{{$users := .Users}}
+{{range .Groups}}
+<h2>{{.Name}}</h2>
+<form data-api="PUT /api/groups/{{.ID}}">
+	<input name="name" value="{{.Name}}" required>
+	<input name="description" value="{{.Description}}" placeholder="Deskripsi" size="40">
+	<button>Simpan</button>
+</form>
+<h3>Anggota</h3>
+{{if .Members}}
+<ul>
+	{{$gid := .ID}}
+	{{range .Members}}
+	<li>
+		<form data-api="DELETE /api/groups/{{$gid}}/members/{{.ID}}" data-confirm="Keluarkan {{.Name}} dari group?">
+			{{.Name}} <button>Keluarkan</button>
+		</form>
+	</li>
+	{{end}}
+</ul>
+{{else}}<p>Belum ada anggota.</p>{{end}}
+<form data-api="POST /api/groups/{{.ID}}/members">
+	<select name="user_id" data-int required>
+		{{range $users}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+	</select>
+	<button>Tambah anggota</button>
+</form>
+<form data-api="DELETE /api/groups/{{.ID}}" data-confirm="Hapus group {{.Name}}? Akses database dari group ini ikut hilang.">
+	<p><button>Hapus group</button></p>
+</form>
+{{else}}
+<p>Belum ada group.</p>
+{{end}}
+
+<h2>Tambah group</h2>
+<form data-api="POST /api/groups">
+	<input name="name" placeholder="Nama group" required>
+	<input name="description" placeholder="Deskripsi" size="40">
+	<button>Tambah</button>
+</form>
+{{template "script"}}
+</html>
