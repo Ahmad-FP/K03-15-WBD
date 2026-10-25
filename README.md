@@ -35,6 +35,10 @@ Session dihapus di backend ketika logout, user dihapus, status admin dicabut, us
 
 Password disimpan sebagai hash bcrypt. Cookie `session` pakai HttpOnly, SameSite=Lax, dan Secure kalau lewat HTTPS. Request yang ubah data dari origin lain ditolak sebagai perlindungan CSRF.
 
+## Akses Database
+
+Kalau user ada di beberapa group yang punya akses ke database yang sama, yang dipakai adalah level akses tertinggi ( view + edit > view only)
+
 ## Database Viewer
 
 User biasa buka `/databases` buat lihat database yang bisa diakses lewat group-nya. Dari situ bisa lihat schema, table/view, kolom, constraint, index, dan isi data (50 baris per halaman, urut primary key kalau ada). Semua query viewer jalan di transaction read-only dengan `statement_timeout` 10 detik.
