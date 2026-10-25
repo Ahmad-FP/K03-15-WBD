@@ -188,8 +188,12 @@ func TestMigrationRunConnectionFailure(t *testing.T) {
 	rec := do(h, "POST", dbPath(id)+"/migrations", sid, url.Values{"name": {"a"}, "sql": {"CREATE TABLE a (id int);"}})
 	path := rec.Header().Get("Location")
 
-	if rec := do(h, "POST", path+"/run", sid, nil); rec.Code != http.StatusBadGateway {
+	rec = do(h, "POST", path+"/run", sid, nil)
+	if rec.Code != http.StatusBadGateway {
 		t.Errorf("run ke database mati: status %d", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "gagal terhubung") || !strings.Contains(body, "Riwayat migration") {
+		t.Error("gagal terhubung harus tampil di halaman detail, bukan teks polos")
 	}
 	if !strings.Contains(do(h, "GET", path, sid, nil).Body.String(), "draft") {
 		t.Error("status harus tetap draft kalau koneksi gagal")

@@ -142,7 +142,7 @@ func (h *Handler) Run(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if m.Status == Success {
-		http.Error(w, ErrLocked.Error(), http.StatusConflict)
+		h.runFailed(w, p, m, http.StatusConflict, ErrLocked.Error())
 		return
 	}
 	// ga ikut batal kalau browser ditutup di tengah jalan, biar riwayat tetap konsisten
@@ -150,17 +150,25 @@ func (h *Handler) Run(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	conn, err := db.Connect(ctx, h.DB, p.DatabaseID)
 	if err != nil {
-		db.ConnectError(w, err)
+		status, msg := db.ConnectStatus(err)
+		h.runFailed(w, p, m, status, msg)
 		return
 	}
 	defer conn.Close(ctx)
 	err = Run(ctx, h.DB, conn, p.DatabaseID, m.ID, session.Current(r).UserID)
 	var execErr *ExecError
 	if err != nil && !errors.As(err, &execErr) {
-		http.Error(w, message(err), statusOf(err))
+		h.runFailed(w, p, m, statusOf(err), message(err))
 		return
 	}
 	http.Redirect(w, r, migrationPath(p.DatabaseID, m.ID), http.StatusSeeOther)
+}
+
+// migration batal dijalanin, balik ke halaman detail sambil nampilin alasannya
+func (h *Handler) runFailed(w http.ResponseWriter, p page, m Migration, status int, msg string) {
+	p.Alert = msg
+	w.WriteHeader(status)
+	h.renderDetail(w, p, m)
 }
 
 func (h *Handler) renderDetail(w http.ResponseWriter, p page, m Migration) {
