@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="id">
+<meta charset="utf-8">
+<title>Koneksi Database</title>
+<p><a href="/">Beranda</a> | <a href="/admin/users">Pengguna</a> | <a href="/admin/groups">Group</a></p>
+<h1>Koneksi Database</h1>
+{{$groups := .Groups}}
+{{range .Databases}}
+<h2>{{.Name}}</h2>
+<p>Host: {{.HostLabel}}</p>
+<form data-api="POST /api/db/{{.ID}}/test" data-stay>
+	<button>Tes koneksi</button> <span class="hasil"></span>
+</form>
+<form data-api="PUT /api/db/{{.ID}}">
+	<input name="name" value="{{.Name}}" required>
+	<input name="host_label" value="{{.HostLabel}}" placeholder="Label host">
+	<input type="password" name="connection_url" placeholder="postgres://user:password@host:5432/db" size="50" required autocomplete="off">
+	<button>Simpan</button>
+</form>
+
+<h3>Akses group</h3>
+{{if .Grants}}
+<table border="1" cellpadding="4">
+	<tr><th>Group</th><th>Akses</th><th></th></tr>
+	{{$dbid := .ID}}
+	{{range .Grants}}
+	<tr>
+		<td>{{.GroupName}}</td>
+		<td>{{if eq .Level "view_edit"}}View + Edit{{else}}View Only{{end}}</td>
+		<td>
+			<form data-api="DELETE /api/db/{{$dbid}}/access/{{.GroupID}}" data-confirm="Cabut akses {{.GroupName}}?"><button>Cabut</button></form>
+		</td>
+	</tr>
+	{{end}}
+</table>
+{{else}}<p>Belum ada group yang punya akses.</p>{{end}}
+<form data-api="PUT /api/db/{{.ID}}/access/{group}">
+	<select name="group" required>
+		{{range $groups}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+	</select>
+	<select name="access_level">
+		<option value="view_only">View Only</option>
+		<option value="view_edit">View + Edit</option>
+	</select>
+	<button>Beri / ubah akses</button>
+</form>
+<form data-api="DELETE /api/db/{{.ID}}" data-confirm="Hapus koneksi {{.Name}}? Riwayat migration-nya ikut terhapus.">
+	<p><button>Hapus koneksi</button></p>
+</form>
+{{else}}
+<p>Belum ada database terdaftar.</p>
+{{end}}
+
+<h2>Daftarkan database</h2>
+<form data-api="POST /api/db">
+	<input name="name" placeholder="Nama" required>
+	<input name="host_label" placeholder="Label host (misal: staging)">
+	<input type="password" name="connection_url" placeholder="postgres://user:password@host:5432/db" size="50" required autocomplete="off">
+	<button>Daftarkan</button>
+</form>
+{{template "script"}}
+</html>

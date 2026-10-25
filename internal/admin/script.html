@@ -1,0 +1,36 @@
+{{define "script"}}
+<p id="pesan"></p>
+<script>
+// form admin dikirim sebagai JSON ke /api, {nama_field} di URL diganti nilai field-nya
+document.querySelectorAll("form[data-api]").forEach(function (form) {
+	form.addEventListener("submit", async function (e) {
+		e.preventDefault();
+		if (form.dataset.confirm && !confirm(form.dataset.confirm)) return;
+		var parts = form.dataset.api.split(" ");
+		var method = parts[0], url = parts[1], body = {};
+		for (var el of form.elements) {
+			if (!el.name) continue;
+			var key = "{" + el.name + "}";
+			if (url.includes(key)) {
+				url = url.replace(key, encodeURIComponent(el.value));
+			} else {
+				body[el.name] = el.dataset.int !== undefined ? Number(el.value) : el.value;
+			}
+		}
+		var res = await fetch(url, {
+			method: method,
+			headers: {"Content-Type": "application/json"},
+			body: method === "DELETE" ? undefined : JSON.stringify(body)
+		});
+		var text = await res.text();
+		if (res.ok && form.dataset.stay === undefined) {
+			location.reload();
+			return;
+		}
+		var out = form.querySelector(".hasil") || document.getElementById("pesan");
+		try { text = JSON.parse(text).message || text; } catch (_) {}
+		out.textContent = (res.ok ? "" : "Gagal: ") + text;
+	});
+});
+</script>
+{{end}}
