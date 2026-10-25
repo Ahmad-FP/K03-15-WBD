@@ -12,6 +12,7 @@ import (
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authorization"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/db"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/groups"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/migration"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/users"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/viewer"
@@ -26,6 +27,7 @@ func newServer(pool *pgxpool.Pool) http.Handler {
 	databaseHandler := &db.Handler{DB: pool}
 	accessHandler := &access.Handler{DB: pool, Sessions: sessions}
 	viewerHandler := &viewer.Handler{DB: pool}
+	migrationHandler := &migration.Handler{DB: pool}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /login", authHandler.LoginPage)
@@ -56,6 +58,13 @@ func newServer(pool *pgxpool.Pool) http.Handler {
 	mux.Handle("GET /databases", sessions.Require(viewerHandler.List))
 	mux.Handle("GET /databases/{id}", dbAccess(authorization.ViewOnly, viewerHandler.Overview))
 	mux.Handle("GET /databases/{id}/tables/{schema}/{table}", dbAccess(authorization.ViewOnly, viewerHandler.Table))
+
+	mux.Handle("GET /databases/{id}/migrations", dbAccess(authorization.ViewOnly, migrationHandler.List))
+	mux.Handle("GET /databases/{id}/migrations/{mid}", dbAccess(authorization.ViewOnly, migrationHandler.Show))
+	mux.Handle("GET /databases/{id}/migrations/new", dbAccess(authorization.ViewEdit, migrationHandler.New))
+	mux.Handle("POST /databases/{id}/migrations", dbAccess(authorization.ViewEdit, migrationHandler.Create))
+	mux.Handle("POST /databases/{id}/migrations/{mid}", dbAccess(authorization.ViewEdit, migrationHandler.Update))
+	mux.Handle("POST /databases/{id}/migrations/{mid}/delete", dbAccess(authorization.ViewEdit, migrationHandler.Delete))
 
 	mux.Handle("GET /admin/users", admin(userHandler.List))
 	mux.Handle("POST /admin/users", admin(userHandler.Create))

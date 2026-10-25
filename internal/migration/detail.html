@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="id">
+<meta charset="utf-8">
+<title>Migration v{{.Version}}</title>
+<p><a href="/databases/{{.DatabaseID}}/migrations">Riwayat migration {{.Database}}</a></p>
+<h1>v{{.Version}} {{.Name}}</h1>
+{{with .Alert}}<p><strong>{{.}}</strong></p>{{end}}
+<table border="1" cellpadding="4">
+	<tr><th>Status</th><td>{{.Status}}</td></tr>
+	<tr><th>Dibuat oleh</th><td>{{.CreatedBy}} ({{.CreatedAt.Format "2006-01-02 15:04:05"}})</td></tr>
+	<tr><th>Terakhir diubah</th><td>{{.UpdatedAt.Format "2006-01-02 15:04:05"}}</td></tr>
+	<tr><th>Dijalankan oleh</th><td>{{.ExecutedBy}} {{with .ExecutedAt}}({{.Format "2006-01-02 15:04:05"}}){{end}}</td></tr>
+	{{with .Error}}<tr><th>Error</th><td><pre>{{.}}</pre></td></tr>{{end}}
+</table>
+
+{{if .Editable}}
+<h2>Edit SQL</h2>
+<form method="post" action="/databases/{{.DatabaseID}}/migrations/{{.ID}}">
+	<p><input name="name" value="{{.Name}}" size="60" required></p>
+	<p><textarea name="sql" rows="20" cols="100" spellcheck="false" style="font-family: monospace">{{.SQL}}</textarea></p>
+	<button>Simpan perubahan</button>
+</form>
+<form method="post" action="/databases/{{.DatabaseID}}/migrations/{{.ID}}/delete">
+	<p><button>Hapus migration</button></p>
+</form>
+{{else}}
+<h2>SQL</h2>
+<pre>{{.SQL}}</pre>
+{{end}}
+</html>

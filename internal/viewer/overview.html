@@ -5,6 +5,7 @@
 <p><a href="/databases">Daftar database</a></p>
 <h1>{{.Name}}</h1>
 <p>Akses: {{if .CanEdit}}View + Edit{{else}}View Only{{end}}</p>
+<p><a href="/databases/{{.ID}}/migrations">Riwayat migration</a>{{if .CanEdit}} | <a href="/databases/{{.ID}}/migrations/new">Buat migration</a>{{end}}</p>
 <h2>Schema</h2>
 {{$id := .ID}}
 {{range .Schemas}}
