@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="id">
+<meta charset="utf-8">
+<title>Database</title>
+<p><a href="/">Beranda</a></p>
+<h1>Database</h1>
+{{if .}}
+<table border="1" cellpadding="4">
+	<tr><th>Nama</th><th>Host</th><th>Akses</th></tr>
+	{{range .}}
+	<tr>
+		<td><a href="/databases/{{.ID}}">{{.Name}}</a></td>
+		<td>{{.HostLabel}}</td>
+		<td>{{if eq .Level "view_edit"}}View + Edit{{else}}View Only{{end}}</td>
+	</tr>
+	{{end}}
+</table>
+{{else}}
+<p>Belum ada database yang bisa diakses. Minta admin masukin kamu ke group yang punya akses.</p>
+{{end}}
+</html>

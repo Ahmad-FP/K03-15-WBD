@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="id">
+<meta charset="utf-8">
+<title>Migration {{.Database}}</title>
+<p><a href="/databases/{{.DatabaseID}}">{{.Database}}</a></p>
+<h1>Riwayat migration</h1>
+{{if .CanEdit}}<p><a href="/databases/{{.DatabaseID}}/migrations/new">Buat migration baru</a></p>{{end}}
+{{if .Migrations}}
+<table border="1" cellpadding="4">
+	<tr><th>Versi</th><th>Nama</th><th>Status</th><th>Dibuat oleh</th><th>Dijalankan oleh</th><th>Waktu eksekusi</th></tr>
+	{{range .Migrations}}
+	<tr>
+		<td><a href="/databases/{{$.DatabaseID}}/migrations/{{.ID}}">{{.Version}}</a></td>
+		<td>{{.Name}}</td>
+		<td>{{.Status}}</td>
+		<td>{{.CreatedBy}}</td>
+		<td>{{.ExecutedBy}}</td>
+		<td>{{with .ExecutedAt}}{{.Format "2006-01-02 15:04:05"}}{{end}}</td>
+	</tr>
+	{{end}}
+</table>
+{{else}}
+<p>Belum ada migration.</p>
+{{end}}
+</html>

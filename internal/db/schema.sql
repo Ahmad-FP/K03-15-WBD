@@ -53,3 +53,21 @@ CREATE TABLE IF NOT EXISTS group_database_access (
     PRIMARY KEY (group_id, database_id)
 );
 CREATE INDEX IF NOT EXISTS idx_group_database_access_database_id ON group_database_access(database_id);
+
+CREATE TABLE IF NOT EXISTS migrations (
+    id bigserial PRIMARY KEY,
+    database_id bigint NOT NULL REFERENCES managed_databases(id) ON DELETE CASCADE,
+    version integer NOT NULL,
+    name text NOT NULL,
+    sql text NOT NULL,
+    status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'success', 'failed')),
+    error text NOT NULL DEFAULT '',
+    created_by bigint REFERENCES users(id) ON DELETE SET NULL,
+    executed_by bigint REFERENCES users(id) ON DELETE SET NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    executed_at timestamptz,
+    UNIQUE (database_id, version)
+);
+-- cuma boleh ada satu migration yang belum sukses per database, biar riwayatnya tetap linear
+CREATE UNIQUE INDEX IF NOT EXISTS idx_migrations_one_pending ON migrations(database_id) WHERE status <> 'success';

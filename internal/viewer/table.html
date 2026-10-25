@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="id">
+<meta charset="utf-8">
+<title>{{.Schema}}.{{.Table}}</title>
+<p><a href="/databases/{{.ID}}">{{.Name}}</a></p>
+<h1>{{.Schema}}.{{.Table}}</h1>
+<p>Jenis: {{.Kind}}</p>
+
+<h2>Kolom</h2>
+<table border="1" cellpadding="4">
+	<tr><th>Nama</th><th>Tipe</th><th>Nullable</th><th>Default</th></tr>
+	{{range .Columns}}
+	<tr><td>{{.Name}}</td><td>{{.Type}}</td><td>{{if .Nullable}}ya{{else}}tidak{{end}}</td><td><code>{{.Default}}</code></td></tr>
+	{{end}}
+</table>
+
+<h2>Constraint</h2>
+{{if .Constraints}}
+<table border="1" cellpadding="4">
+	<tr><th>Nama</th><th>Jenis</th><th>Definisi</th></tr>
+	{{range .Constraints}}
+	<tr><td>{{.Name}}</td><td>{{.Type}}</td><td><code>{{.Definition}}</code></td></tr>
+	{{end}}
+</table>
+{{else}}<p>Tidak ada constraint.</p>{{end}}
+
+<h2>Index</h2>
+{{if .Indexes}}
+<table border="1" cellpadding="4">
+	<tr><th>Nama</th><th>Definisi</th><th>Unique</th><th>Primary</th></tr>
+	{{range .Indexes}}
+	<tr><td>{{.Name}}</td><td><code>{{.Definition}}</code></td><td>{{if .Unique}}ya{{end}}</td><td>{{if .Primary}}ya{{end}}</td></tr>
+	{{end}}
+</table>
+{{else}}<p>Tidak ada index.</p>{{end}}
+
+<h2>Data</h2>
+<p>Halaman {{.Page}}</p>
+{{if .Data.Rows}}
+<table border="1" cellpadding="4">
+	<tr>{{range .Data.Columns}}<th>{{.}}</th>{{end}}</tr>
+	{{range .Data.Rows}}
+	<tr>{{range .}}<td>{{if .Null}}<i>NULL</i>{{else}}{{.Text}}{{end}}</td>{{end}}</tr>
+	{{end}}
+</table>
+{{else}}<p>Tidak ada data.</p>{{end}}
+<p>
+	{{if gt .Page 1}}<a href="?page={{dec .Page}}">&laquo; Sebelumnya</a>{{end}}
+	{{if .Data.HasNext}}<a href="?page={{inc .Page}}">Berikutnya &raquo;</a>{{end}}
+</p>
+</html>

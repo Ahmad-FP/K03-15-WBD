@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="id">
+<meta charset="utf-8">
+<title>Migration baru</title>
+<p><a href="/databases/{{.DatabaseID}}/migrations">Riwayat migration {{.Database}}</a></p>
+<h1>Migration baru</h1>
+{{with .Alert}}<p><strong>{{.}}</strong></p>{{end}}
+<form method="post" action="/databases/{{.DatabaseID}}/migrations">
+	<p><input name="name" value="{{.Name}}" placeholder="Nama migration" size="60" required></p>
+	<p><textarea name="sql" rows="20" cols="100" spellcheck="false" style="font-family: monospace" placeholder="CREATE TABLE ...">{{.SQL}}</textarea></p>
+	<p>SQL dijalankan dalam satu transaction, jadi tidak perlu BEGIN/COMMIT.</p>
+	<button>Simpan draft</button>
+</form>
+</html>
