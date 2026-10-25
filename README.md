@@ -1,3 +1,23 @@
+## Run
+
+Min Version : >= Go 1.26.2  dan PostgreSQL.
+
+```sh
+export DATABASE_URL=postgres://<user>:<password>@localhost:5432/app
+export DATABASE_CREDENTIALS_KEY=<64 char hex>
+go run .
+```
+
+ http://localhost:8080 lalu login pakai `admin` / `admin`. 
+
+`DATABASE_CREDENTIALS_KEY`  gunakan `openssl rand -hex 32` 
+
+## Test
+
+```sh
+TEST_DATABASE_URL=postgres://user:password@localhost:5432/test go test ./...
+```
+
 ## Session
 
 | | Nilai |
@@ -8,6 +28,12 @@
 | Grace period ID lama | 60 detik |
 
 ID session rotasi kalau login, user dijadikan Platform Admin, user masuk group, akses group ke database diberikan atau berubah, dan tiap 15 menit. Absolute Expiration tidak terpengaruh.
+
+ID lama masih diterima selama grace period dan response-nya ngirim ID yang baru, jadi request yang barengan atau response yang hilang ga bikin logout.
+
+Session dihapus di backend ketika logout, user dihapus, status admin dicabut, user dikeluarkan dari group, akses group ke database dicabut, atau group dihapus.
+
+Password disimpan sebagai hash bcrypt. Cookie `session` pakai HttpOnly, SameSite=Lax, dan Secure kalau lewat HTTPS. Request yang ubah data dari origin lain ditolak sebagai perlindungan CSRF.
 
 ## Database Viewer
 

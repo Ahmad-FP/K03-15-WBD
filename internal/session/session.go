@@ -90,8 +90,8 @@ func (s *Store) resolve(w http.ResponseWriter, r *http.Request) (Session, bool) 
 		return Session{}, false
 	}
 	if rotate && sess.ID == c.Value {
-		sess.ID = rand.Text()
-		s.DB.Exec(r.Context(), "UPDATE sessions SET prev_id = id, prev_until = $3, id = $2, rotated_at = $4, last_seen_at = $4 WHERE id = $1", c.Value, sess.ID, now.Add(Grace), now)
+		s.DB.Exec(r.Context(), "UPDATE sessions SET prev_id = id, prev_until = $3, id = $2, rotated_at = $4, last_seen_at = $4 WHERE id = $1", c.Value, rand.Text(), now.Add(Grace), now)
+		s.DB.QueryRow(r.Context(), "SELECT id FROM sessions WHERE prev_id = $1", c.Value).Scan(&sess.ID)
 	} else {
 		s.DB.Exec(r.Context(), "UPDATE sessions SET last_seen_at = $2 WHERE id = $1", sess.ID, now)
 	}
