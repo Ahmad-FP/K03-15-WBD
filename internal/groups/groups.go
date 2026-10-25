@@ -107,6 +107,8 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// session anggota dicabut duluan, habis group dihapus daftar anggotanya ikut hilang
+	h.Sessions.RevokeGroup(r.Context(), id)
 	tag, err := h.DB.Exec(r.Context(), `DELETE FROM platform_groups WHERE id=$1`, id)
 	if err != nil {
 		http.Error(w, "group tidak dapat dihapus", 500)
@@ -187,6 +189,7 @@ func (h *Handler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "keanggotaan tidak ditemukan", 404)
 		return
 	}
+	h.Sessions.RevokeUser(r.Context(), uid)
 	w.WriteHeader(http.StatusNoContent)
 }
 

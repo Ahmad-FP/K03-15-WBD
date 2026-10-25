@@ -57,6 +57,11 @@ func (s *Store) RevokeUser(ctx context.Context, userID int64) {
 	s.DB.Exec(ctx, "DELETE FROM sessions WHERE user_id = $1", userID)
 }
 
+// logout paksa semua anggota group, dipakai waktu akses group dicabut
+func (s *Store) RevokeGroup(ctx context.Context, groupID int64) {
+	s.DB.Exec(ctx, "DELETE FROM sessions WHERE user_id IN (SELECT user_id FROM group_members WHERE group_id = $1)", groupID)
+}
+
 func (s *Store) Require(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sess, ok := s.resolve(w, r)

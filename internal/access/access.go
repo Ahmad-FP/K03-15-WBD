@@ -103,6 +103,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "akses tidak ditemukan", 404)
 		return
 	}
+	h.Sessions.RevokeGroup(r.Context(), groupID)
 	w.WriteHeader(http.StatusNoContent)
 }
 

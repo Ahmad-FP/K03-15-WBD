@@ -182,11 +182,45 @@ func TestAccessAPI(t *testing.T) {
 	if rec := doJSON(h, "DELETE", path, admin, ""); rec.Code != http.StatusNoContent {
 		t.Fatalf("revoke: status %d", rec.Code)
 	}
+	if loggedIn(h, sid) {
+		t.Error("session masih aktif setelah akses dicabut")
+	}
+	sid = login(t, h, "budi", "rahasia")
 	if rec := do(h, "GET", dbPath(id), sid, nil); rec.Code != http.StatusForbidden {
 		t.Errorf("akses masih ada setelah dicabut: status %d", rec.Code)
 	}
 	if rec := doJSON(h, "DELETE", path, admin, ""); rec.Code != http.StatusNotFound {
 		t.Errorf("revoke dua kali: status %d", rec.Code)
+	}
+}
+
+func TestRevokeEndsSession(t *testing.T) {
+	h, pool := testServer(t)
+	admin := login(t, h, "admin", "admin")
+	budi := addUser(t, pool, "budi", "rahasia")
+	siti := addUser(t, pool, "siti", "rahasia")
+	gid := jsonID(t, doJSON(h, "POST", "/api/groups", admin, `{"name":"dev"}`))
+	base := "/api/groups/" + itoa(gid)
+	for _, uid := range []int64{budi, siti} {
+		doJSON(h, "POST", base+"/members", admin, `{"user_id":`+itoa(uid)+`}`)
+	}
+	budiSid := login(t, h, "budi", "rahasia")
+	sitiSid := login(t, h, "siti", "rahasia")
+
+	doJSON(h, "DELETE", base+"/members/"+itoa(budi), admin, "")
+	if loggedIn(h, budiSid) {
+		t.Error("session budi masih aktif setelah dikeluarkan dari group")
+	}
+	if !loggedIn(h, sitiSid) {
+		t.Error("session siti ikut hilang padahal masih anggota")
+	}
+
+	doJSON(h, "DELETE", base, admin, "")
+	if loggedIn(h, sitiSid) {
+		t.Error("session siti masih aktif setelah group dihapus")
+	}
+	if !loggedIn(h, admin) {
+		t.Error("session admin ikut hilang")
 	}
 }
 
