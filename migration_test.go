@@ -113,3 +113,85 @@ func TestMigrationViewOnly(t *testing.T) {
 		t.Error("SQL berubah padahal request ditolak")
 	}
 }
+
+func TestMigrationRunCommit(t *testing.T) {
+	e, exists := setupMigration(t)
+	path := createMigration(t, e, "tambah produk", `
+		CREATE TABLE produk (id serial PRIMARY KEY, nama text NOT NULL);
+		INSERT INTO produk (nama) VALUES ('sabun; wangi');`)
+
+	if rec := do(e.h, "POST", path+"/run", e.editor, nil); rec.Code != http.StatusSeeOther {
+		t.Fatalf("run: status %d %s", rec.Code, rec.Body)
+	}
+	if !exists("produk") {
+		t.Fatal("table produk tidak terbentuk")
+	}
+	body := do(e.h, "GET", dbPath(e.id)+"/migrations", e.viewer, nil).Body.String()
+	if !strings.Contains(body, "success") || !strings.Contains(body, "editor") {
+		t.Error("riwayat tidak mencatat status/pelaksana")
+	}
+
+	for _, p := range []string{path + "/run", path, path + "/delete"} {
+		if rec := do(e.h, "POST", p, e.editor, url.Values{"name": {"x"}, "sql": {"SELECT 1"}}); rec.Code != http.StatusConflict {
+			t.Errorf("POST %s ke migration yang sudah sukses: status %d", p, rec.Code)
+		}
+	}
+
+	next := createMigration(t, e, "tambah stok", "ALTER TABLE produk ADD COLUMN stok int;")
+	if !strings.Contains(do(e.h, "GET", next, e.editor, nil).Body.String(), "v2 tambah stok") {
+		t.Error("versi berikutnya harus v2")
+	}
+}
+
+func TestMigrationRunRollback(t *testing.T) {
+	e, exists := setupMigration(t)
+	path := createMigration(t, e, "gagal", "CREATE TABLE produk (id int); INSERT INTO tidak_ada VALUES (1);")
+
+	if rec := do(e.h, "POST", path+"/run", e.editor, nil); rec.Code != http.StatusSeeOther {
+		t.Fatalf("run: status %d", rec.Code)
+	}
+	if exists("produk") {
+		t.Error("table produk tetap ada padahal migration gagal (tidak di-rollback)")
+	}
+	body := do(e.h, "GET", path, e.editor, nil).Body.String()
+	if !strings.Contains(body, "failed") || !strings.Contains(body, "tidak_ada") {
+		t.Error("status failed atau pesan error tidak tercatat")
+	}
+
+	do(e.h, "POST", path, e.editor, url.Values{"name": {"diperbaiki"}, "sql": {"CREATE TABLE produk (id int);"}})
+	do(e.h, "POST", path+"/run", e.editor, nil)
+	if !exists("produk") || !strings.Contains(do(e.h, "GET", path, e.editor, nil).Body.String(), "v1 diperbaiki") {
+		t.Error("migration yang diperbaiki harus sukses dengan versi yang sama")
+	}
+}
+
+func TestMigrationRunDenied(t *testing.T) {
+	e, exists := setupMigration(t)
+	path := createMigration(t, e, "tambah produk", "CREATE TABLE produk (id int);")
+
+	for _, sid := range []string{e.viewer, e.other} {
+		if rec := do(e.h, "POST", path+"/run", sid, nil); rec.Code != http.StatusForbidden {
+			t.Errorf("run tanpa View + Edit: status %d", rec.Code)
+		}
+	}
+	if exists("produk") {
+		t.Error("migration tetap jalan padahal ditolak")
+	}
+}
+
+func TestMigrationRunConnectionFailure(t *testing.T) {
+	h, pool := testServer(t)
+	admin := login(t, h, "admin", "admin")
+	id := addTarget(t, h, admin, "postgres://user:pw@127.0.0.1:1/mati")
+	grant(t, pool, addUser(t, pool, "editor", "rahasia"), id, "view_edit")
+	sid := login(t, h, "editor", "rahasia")
+	rec := do(h, "POST", dbPath(id)+"/migrations", sid, url.Values{"name": {"a"}, "sql": {"CREATE TABLE a (id int);"}})
+	path := rec.Header().Get("Location")
+
+	if rec := do(h, "POST", path+"/run", sid, nil); rec.Code != http.StatusBadGateway {
+		t.Errorf("run ke database mati: status %d", rec.Code)
+	}
+	if !strings.Contains(do(h, "GET", path, sid, nil).Body.String(), "draft") {
+		t.Error("status harus tetap draft kalau koneksi gagal")
+	}
+}

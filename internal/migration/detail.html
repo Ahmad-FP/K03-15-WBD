@@ -14,6 +14,9 @@
 </table>
 
 {{if .Editable}}
+<form method="post" action="/databases/{{.DatabaseID}}/migrations/{{.ID}}/run">
+	<p><button>Jalankan migration</button> SQL di bawah dijalankan dalam satu transaction. Kalau ada yang gagal, semua perubahan di-rollback.</p>
+</form>
 <h2>Edit SQL</h2>
 <form method="post" action="/databases/{{.DatabaseID}}/migrations/{{.ID}}">
 	<p><input name="name" value="{{.Name}}" size="60" required></p>

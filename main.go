@@ -65,6 +65,7 @@ func newServer(pool *pgxpool.Pool) http.Handler {
 	mux.Handle("POST /databases/{id}/migrations", dbAccess(authorization.ViewEdit, migrationHandler.Create))
 	mux.Handle("POST /databases/{id}/migrations/{mid}", dbAccess(authorization.ViewEdit, migrationHandler.Update))
 	mux.Handle("POST /databases/{id}/migrations/{mid}/delete", dbAccess(authorization.ViewEdit, migrationHandler.Delete))
+	mux.Handle("POST /databases/{id}/migrations/{mid}/run", dbAccess(authorization.ViewEdit, migrationHandler.Run))
 
 	mux.Handle("GET /admin/users", admin(userHandler.List))
 	mux.Handle("POST /admin/users", admin(userHandler.Create))

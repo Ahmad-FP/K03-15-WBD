@@ -1,11 +1,13 @@
 package migration
 
 import (
+	"context"
 	"embed"
 	"errors"
 	"html/template"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authorization"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/db"
@@ -127,6 +129,38 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, migrationsPath(p.DatabaseID), http.StatusSeeOther)
+}
+
+// eksekusi migration ke database target, hasilnya keliatan di halaman detail
+func (h *Handler) Run(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.page(w, r)
+	if !ok {
+		return
+	}
+	m, ok := h.find(w, r, p)
+	if !ok {
+		return
+	}
+	if m.Status == Success {
+		http.Error(w, ErrLocked.Error(), http.StatusConflict)
+		return
+	}
+	// ga ikut batal kalau browser ditutup di tengah jalan, biar riwayat tetap konsisten
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
+	defer cancel()
+	conn, err := db.Connect(ctx, h.DB, p.DatabaseID)
+	if err != nil {
+		db.ConnectError(w, err)
+		return
+	}
+	defer conn.Close(ctx)
+	err = Run(ctx, h.DB, conn, p.DatabaseID, m.ID, session.Current(r).UserID)
+	var execErr *ExecError
+	if err != nil && !errors.As(err, &execErr) {
+		http.Error(w, message(err), statusOf(err))
+		return
+	}
+	http.Redirect(w, r, migrationPath(p.DatabaseID, m.ID), http.StatusSeeOther)
 }
 
 func (h *Handler) renderDetail(w http.ResponseWriter, p page, m Migration) {
