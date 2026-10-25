@@ -18,7 +18,11 @@ import (
 //go:embed *.html
 var files embed.FS
 
-var tmpl = template.Must(template.New("").Funcs(template.FuncMap{"pathEscape": url.PathEscape}).ParseFS(files, "*.html"))
+var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
+	"pathEscape": url.PathEscape,
+	"inc":        func(n int) int { return n + 1 },
+	"dec":        func(n int) int { return n - 1 },
+}).ParseFS(files, "*.html"))
 
 type Handler struct{ DB *pgxpool.Pool }
 
@@ -92,7 +96,7 @@ func (h *Handler) Overview(w http.ResponseWriter, r *http.Request) {
 	}{p, schemas})
 }
 
-// detail satu table: kolom, constraint, index
+// detail satu table: kolom, constraint, index, dan isi datanya
 func (h *Handler) Table(w http.ResponseWriter, r *http.Request) {
 	p, ok := h.page(w, r)
 	if !ok {
@@ -129,13 +133,21 @@ func (h *Handler) Table(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "gagal membaca index", http.StatusBadGateway)
 		return
 	}
+	num := parsePage(r.URL.Query().Get("page"))
+	data, err := readRows(ctx, tx, schema, name, oid, num)
+	if err != nil {
+		http.Error(w, "gagal membaca data table", http.StatusBadGateway)
+		return
+	}
 	tmpl.ExecuteTemplate(w, "table.html", struct {
 		page
 		Schema, Table, Kind string
 		Columns             []column
 		Constraints         []constraint
 		Indexes             []index
-	}{p, schema, name, kind, cols, cons, idx})
+		Data                tableData
+		Page                int
+	}{p, schema, name, kind, cols, cons, idx, data, num})
 }
 
 // data umum buat header halaman (nama db, boleh edit atau ngga)

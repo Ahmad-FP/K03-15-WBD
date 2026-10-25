@@ -33,4 +33,19 @@
 	{{end}}
 </table>
 {{else}}<p>Tidak ada index.</p>{{end}}
+
+<h2>Data</h2>
+<p>Halaman {{.Page}}</p>
+{{if .Data.Rows}}
+<table border="1" cellpadding="4">
+	<tr>{{range .Data.Columns}}<th>{{.}}</th>{{end}}</tr>
+	{{range .Data.Rows}}
+	<tr>{{range .}}<td>{{if .Null}}<i>NULL</i>{{else}}{{.Text}}{{end}}</td>{{end}}</tr>
+	{{end}}
+</table>
+{{else}}<p>Tidak ada data.</p>{{end}}
+<p>
+	{{if gt .Page 1}}<a href="?page={{dec .Page}}">&laquo; Sebelumnya</a>{{end}}
+	{{if .Data.HasNext}}<a href="?page={{inc .Page}}">Berikutnya &raquo;</a>{{end}}
+</p>
 </html>

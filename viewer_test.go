@@ -172,3 +172,36 @@ func TestViewerConnectionFailure(t *testing.T) {
 		t.Error("password database target bocor di response")
 	}
 }
+
+func TestViewerData(t *testing.T) {
+	h, pool := testServer(t)
+	admin := login(t, h, "admin", "admin")
+	target, dsn := targetSchema(t)
+	id := addTarget(t, h, admin, dsn)
+	budi := addUser(t, pool, "budi", "rahasia")
+	grant(t, pool, budi, id, "view_only")
+	_, err := target.Exec(context.Background(), `
+		CREATE TABLE barang (id int PRIMARY KEY, nama text, info jsonb);
+		INSERT INTO barang SELECT g, 'barang-' || g, '{"stok": 1}' FROM generate_series(1, 60) g;
+		UPDATE barang SET nama = NULL WHERE id = 1;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema string
+	target.QueryRow(context.Background(), "SELECT current_schema()").Scan(&schema)
+	sid := login(t, h, "budi", "rahasia")
+	path := dbPath(id) + "/tables/" + schema + "/barang"
+
+	body := do(h, "GET", path, sid, nil).Body.String()
+	if !strings.Contains(body, "<i>NULL</i>") || !strings.Contains(body, "barang-50") || strings.Contains(body, "barang-51<") {
+		t.Error("halaman 1 harus berisi baris 1-50")
+	}
+	if !strings.Contains(body, `{&#34;stok&#34;: 1}`) || !strings.Contains(body, "?page=2") {
+		t.Error("jsonb atau link halaman berikutnya tidak muncul")
+	}
+
+	body = do(h, "GET", path+"?page=2", sid, nil).Body.String()
+	if !strings.Contains(body, "barang-60") || strings.Contains(body, "barang-50<") || strings.Contains(body, "?page=3") {
+		t.Error("halaman 2 harus berisi baris 51-60 tanpa link berikutnya")
+	}
+}

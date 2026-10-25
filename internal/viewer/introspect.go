@@ -3,6 +3,8 @@ package viewer
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -148,4 +150,92 @@ func constraintType(t string) string {
 		return "NOT NULL"
 	}
 	return t
+}
+
+const (
+	pageSize = 50
+	maxCell  = 200
+)
+
+type cell struct {
+	Text string
+	Null bool
+}
+
+type tableData struct {
+	Columns []string
+	Rows    [][]cell
+	HasNext bool
+}
+
+// kolom primary key, dipakai buat ngurutin data biar pagination stabil
+func primaryKey(ctx context.Context, tx pgx.Tx, oid uint32) ([]string, error) {
+	rows, err := tx.Query(ctx, `SELECT a.attname FROM pg_index i
+		JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+		WHERE i.indrelid = $1 AND i.indisprimary
+		ORDER BY array_position(i.indkey::int2[], a.attnum)`, oid)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// ambil isi table per halaman, nilainya pakai format text bawaan postgres
+func readRows(ctx context.Context, tx pgx.Tx, schema, table string, oid uint32, page int) (tableData, error) {
+	pk, err := primaryKey(ctx, tx, oid)
+	if err != nil {
+		return tableData{}, err
+	}
+	q := "SELECT * FROM " + pgx.Identifier{schema, table}.Sanitize()
+	if len(pk) > 0 {
+		cols := make([]string, len(pk))
+		for i, c := range pk {
+			cols[i] = pgx.Identifier{c}.Sanitize()
+		}
+		q += " ORDER BY " + strings.Join(cols, ", ")
+	}
+	q += " LIMIT $1 OFFSET $2"
+	rows, err := tx.Query(ctx, q, pgx.QueryResultFormats{pgx.TextFormatCode}, pageSize+1, (page-1)*pageSize)
+	if err != nil {
+		return tableData{}, err
+	}
+	defer rows.Close()
+	var data tableData
+	for _, f := range rows.FieldDescriptions() {
+		data.Columns = append(data.Columns, f.Name)
+	}
+	for rows.Next() {
+		if len(data.Rows) == pageSize {
+			data.HasNext = true
+			break
+		}
+		raw := rows.RawValues()
+		row := make([]cell, len(raw))
+		for i, v := range raw {
+			row[i] = toCell(v)
+		}
+		data.Rows = append(data.Rows, row)
+	}
+	return data, rows.Err()
+}
+
+// nilai NULL ditandain, yang kepanjangan dipotong biar tabel ga melebar
+func toCell(raw []byte) cell {
+	if raw == nil {
+		return cell{Null: true}
+	}
+	r := []rune(string(raw))
+	if len(r) > maxCell {
+		return cell{Text: string(r[:maxCell]) + "…"}
+	}
+	return cell{Text: string(r)}
+}
+
+// nomor halaman dari query string, minimal 1 dan dibatasin biar OFFSET ga overflow
+func parsePage(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 {
+		return 1
+	}
+	return min(n, 1_000_000)
 }
