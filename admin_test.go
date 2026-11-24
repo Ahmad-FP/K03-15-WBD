@@ -230,11 +230,16 @@ func TestAdminRoutesNeedAdmin(t *testing.T) {
 	budi := login(t, h, "budi", "rahasia")
 
 	routes := [][2]string{
-		{"GET", "/admin/users"}, {"GET", "/admin/groups"}, {"GET", "/admin/databases"},
+		{"GET", "/admin/users"}, {"POST", "/admin/users"},
+		{"POST", "/admin/users/1/password"}, {"POST", "/admin/users/1/admin"}, {"POST", "/admin/users/1/delete"},
+		{"GET", "/admin/groups"}, {"GET", "/admin/databases"},
 		{"GET", "/api/groups"}, {"POST", "/api/groups"}, {"PUT", "/api/groups/1"}, {"DELETE", "/api/groups/1"},
 		{"GET", "/api/groups/1/members"}, {"POST", "/api/groups/1/members"}, {"DELETE", "/api/groups/1/members/1"},
 		{"GET", "/api/db"}, {"POST", "/api/db"}, {"PUT", "/api/db/1"}, {"DELETE", "/api/db/1"}, {"POST", "/api/db/1/test"},
 		{"GET", "/api/db/1/access"}, {"PUT", "/api/db/1/access/1"}, {"DELETE", "/api/db/1/access/1"},
+	}
+	if strings.Contains(do(h, "GET", "/", budi, nil).Body.String(), "/admin/") {
+		t.Error("non-admin melihat link admin di beranda")
 	}
 	for _, r := range routes {
 		if rec := doJSON(h, r[0], r[1], budi, `{"name":"x"}`); rec.Code != http.StatusForbidden {

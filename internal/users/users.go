@@ -36,7 +36,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	_, err := h.DB.Exec(r.Context(), "INSERT INTO users (username, password_hash, is_admin) VALUES ($1, $2, $3)",
-		r.FormValue("username"), authentication.Hash(r.FormValue("password")), r.FormValue("admin") != "")
+		r.FormValue("username"), authentication.Hash(r.FormValue("password")), r.FormValue("admin") == "true")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

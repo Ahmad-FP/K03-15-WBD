@@ -230,7 +230,7 @@ func TestUserManagement(t *testing.T) {
 	ctx := context.Background()
 	admin := login(t, h, "admin", "admin")
 
-	rec := do(h, "POST", "/admin/users", admin, url.Values{"username": {"budi"}, "password": {"rahasia"}})
+	rec := do(h, "POST", "/admin/users", admin, url.Values{"username": {"budi"}, "password": {"rahasia"}, "admin": {"false"}})
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("create: status %d", rec.Code)
 	}
@@ -239,9 +239,13 @@ func TestUserManagement(t *testing.T) {
 	}
 	var id int64
 	var hash string
-	pool.QueryRow(ctx, "SELECT id, password_hash FROM users WHERE username = 'budi'").Scan(&id, &hash)
+	var isAdmin bool
+	pool.QueryRow(ctx, "SELECT id, password_hash, is_admin FROM users WHERE username = 'budi'").Scan(&id, &hash, &isAdmin)
 	if hash == "rahasia" || !authentication.Check(hash, "rahasia") {
 		t.Error("password not stored as a hash")
+	}
+	if isAdmin {
+		t.Error("admin=false should not create an admin user")
 	}
 	budi := login(t, h, "budi", "rahasia")
 

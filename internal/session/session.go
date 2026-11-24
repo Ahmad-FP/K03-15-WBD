@@ -34,6 +34,11 @@ func Current(r *http.Request) Session {
 	return r.Context().Value(key{}).(Session)
 }
 
+func FromContext(ctx context.Context) (Session, bool) {
+	s, ok := ctx.Value(key{}).(Session)
+	return s, ok
+}
+
 func (s *Store) Start(w http.ResponseWriter, r *http.Request, userID int64) {
 	id := rand.Text()
 	s.DB.Exec(r.Context(), "INSERT INTO sessions (id, user_id, created_at, last_seen_at, rotated_at) VALUES ($1, $2, $3, $3, $3)", id, userID, time.Now())
@@ -64,6 +69,7 @@ func (s *Store) RevokeGroup(ctx context.Context, groupID int64) {
 
 func (s *Store) Require(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		sess, ok := s.resolve(w, r)
 		if !ok {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
