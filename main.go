@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"github.com/Ahmad-FP/K03-15-WBD/internal/groups"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/migration"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/telemetry"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/users"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/viewer"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -104,7 +106,28 @@ func main() {
 	if dsn == "" {
 		log.Fatal("DATABASE_URL belum diatur")
 	}
-	pool, err := pgxpool.New(ctx, dsn)
+	poolConfig, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// --- telemetry (Track 3): log JSON ke stdout, span OTel ke stderr, trace setiap query platform ---
+	slog.SetDefault(telemetry.NewLogger(os.Stdout))
+	shutdownTracing, err := telemetry.Init("api", os.Stderr)
+	if err != nil {
+		log.Fatal("gagal menyiapkan tracing: ", err)
+	}
+	defer shutdownTracing(context.Background())
+	telemetry.SetActorFunc(func(ctx context.Context) string {
+		if s, ok := session.FromContext(ctx); ok {
+			return s.Username
+		}
+		return ""
+	})
+	poolConfig.ConnConfig.Tracer = &telemetry.QueryTracer{DB: "platform"}
+	// --- akhir telemetry ---
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -116,5 +139,5 @@ func main() {
 	if _, err := pool.Exec(ctx, db.Schema); err != nil {
 		log.Fatal("gagal menyiapkan schema: ", err)
 	}
-	log.Fatal(http.ListenAndServe(":8080", newServer(pool)))
+	log.Fatal(http.ListenAndServe(":8080", telemetry.Middleware(newServer(pool))))
 }
