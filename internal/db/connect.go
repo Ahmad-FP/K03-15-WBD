@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Ahmad-FP/K03-15-WBD/internal/telemetry"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -34,6 +35,7 @@ func Connect(ctx context.Context, app *pgxpool.Pool, id int64) (*pgx.Conn, error
 		return nil, ErrUnreachable
 	}
 	cfg.ConnectTimeout = 5 * time.Second
+	cfg.Tracer = &telemetry.QueryTracer{DB: "target"}
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		return nil, ErrUnreachable
