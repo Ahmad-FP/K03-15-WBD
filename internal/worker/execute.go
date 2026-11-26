@@ -133,13 +133,18 @@ func (x *Executor) run(ctx context.Context, job *Job, e execution) outcome {
 	}
 	defer target.Close(context.WithoutCancel(ctx))
 	if e.BatchSize == 0 {
+		if e.Operation == "compensate" || e.Operation == "retry" {
+			return outcome{status: "failed", err: errors.New(e.Operation + " hanya untuk migration mode batch")}
+		}
 		return runNormal(ctx, target, e)
 	}
 	switch e.Operation {
 	case "up", "forward", "retry":
 		return x.runBatch(ctx, job, target, e)
+	case "rollback", "compensate":
+		return x.runReverseBatch(ctx, job, target, e)
 	}
-	return outcome{status: "failed", err: errors.New("operasi " + e.Operation + " mode batch belum didukung worker")}
+	return outcome{status: "failed", err: errors.New("operasi " + e.Operation + " tidak dikenal")}
 }
 
 // mode normal: seluruh SQL dalam satu transaksi + checkpoint batch 1 sebagai bukti commit
