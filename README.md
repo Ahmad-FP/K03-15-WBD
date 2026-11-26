@@ -60,3 +60,7 @@ Kalau database target ga bisa dihubungi, response-nya 502 tanpa nampilin detail 
 - SQL dijalankan dalam satu transaction di database target dengan `statement_timeout` 60 detik. Kalau semua statement berhasil di-commit, kalau ada yang gagal di-rollback semua.
 - SQL tidak boleh berisi `BEGIN`/`COMMIT`/`ROLLBACK`/`END` karena transaction-nya diatur sistem. Statement yang memang tidak bisa jalan di dalam transaction (misal `CREATE INDEX CONCURRENTLY`) akan gagal dan di-rollback.
 - Yang dicatat: versi, nama, SQL, pembuat, pelaksana, waktu eksekusi, status, dan error terakhir.
+
+## Worker Migration (Milestone 2)
+
+Eksekusi migration berjalan asynchronous lewat worker terpisah: `go run ./cmd/worker` dengan `DATABASE_URL` dan `DATABASE_CREDENTIALS_KEY` yang sama seperti API. Cara kerja lock, batch, retry, crash recovery, logging/tracing, hasil benchmark data besar, dan cara menjalankan test ada di [docs/worker.md](docs/worker.md).
