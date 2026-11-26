@@ -54,14 +54,20 @@ func addDatabase(t *testing.T, pool *pgxpool.Pool, name string, dsn []byte) int6
 // migration + execution berstatus pending + job di antrean, balikin id job dan execution
 func enqueue(t *testing.T, pool *pgxpool.Pool, dbID int64, version int) (jobID, execID int64) {
 	t.Helper()
+	return enqueueSQL(t, pool, dbID, version, "up", "SELECT 1")
+}
+
+func enqueueSQL(t *testing.T, pool *pgxpool.Pool, dbID int64, version int, op, sql string) (jobID, execID int64) {
+	t.Helper()
 	ctx := context.Background()
 	var mid int64
-	if err := pool.QueryRow(ctx, `INSERT INTO migrations (database_id, version, name, sql) VALUES ($1, $2, $3, 'SELECT 1') RETURNING id`,
-		dbID, version, "m"+rand.Text()).Scan(&mid); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO migrations (database_id, version, name, sql) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (database_id, version) DO UPDATE SET name = migrations.name RETURNING id`,
+		dbID, version, "m"+rand.Text(), sql).Scan(&mid); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status)
-		VALUES ($1, $2, $3, 'up', 'SELECT 1', 'pending') RETURNING id`, mid, dbID, version).Scan(&execID); err != nil {
+		VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING id`, mid, dbID, version, op, sql).Scan(&execID); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `INSERT INTO migration_jobs (execution_id) VALUES ($1) RETURNING id`, execID).Scan(&jobID); err != nil {

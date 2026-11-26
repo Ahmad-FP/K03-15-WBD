@@ -43,6 +43,11 @@ func Connect(ctx context.Context, app *pgxpool.Pool, id int64) (*pgx.Conn, error
 	return conn, nil
 }
 
+// enkripsi DSN dengan kunci yang sama seperti saat admin menyimpan database (dipakai test worker)
+func EncryptDSN(dsn string) ([]byte, error) {
+	return encryptDSN(dsn)
+}
+
 // ambil nama database buat judul halaman
 func Name(ctx context.Context, app *pgxpool.Pool, id int64) (string, error) {
 	var name string
