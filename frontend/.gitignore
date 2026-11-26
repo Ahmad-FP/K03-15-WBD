@@ -1,1 +1,8 @@
-node_modules/\ndist/\n
+node_modules/
+dist/
+
+.env
+.env.local
+.env.*.local
+*.tsbuildinfo
+.DS_Store
