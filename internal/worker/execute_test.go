@@ -127,8 +127,13 @@ func TestExecuteNormalFailureRollsBack(t *testing.T) {
 func TestExecuteRollbackOperation(t *testing.T) {
 	pool := platform(t)
 	tp, dbID := target(t, pool)
-	tp.Exec(context.Background(), "CREATE TABLE items (id int)")
+	ctx := context.Background()
+	tp.Exec(ctx, "CREATE TABLE items (id int)")
+	// v1 sudah aktif (up sukses), rollback merujuk eksekusi aktif itu
+	m1 := addMigration(t, pool, dbID, 1)
+	up := addExec(t, pool, dbID, row{migration: m1, version: 1, op: "up", status: "success"})
 	_, execID := enqueueSQL(t, pool, dbID, 1, "rollback", "DROP TABLE items")
+	pool.Exec(ctx, `UPDATE migration_executions SET reverted_execution_id = $2, parent_execution_id = $2 WHERE id = $1`, execID, up)
 	execute(t, pool)
 
 	if r := execState(t, pool, execID); r.status != "success" {

@@ -70,9 +70,23 @@ func (x *Executor) Handle(ctx context.Context, job *Job) {
 	ctx, span := telemetry.Tracer().Start(ctx, "migration.execute")
 	defer span.End()
 
+	d, err := x.revalidate(ctx, job, e)
+	if err != nil || d.verdict == requeue {
+		slog.InfoContext(ctx, "migration.requeued", "reason", d.reason, "error", err)
+		if err := job.Requeue(ctx, requeueDelay); err != nil {
+			slog.ErrorContext(ctx, "worker.requeue_failed", "error", err)
+		}
+		return
+	}
+
 	started := time.Now()
 	logAttempt(ctx, "migration.attempt.start", job, e, "running", nil)
-	out := x.run(ctx, job, e)
+	var out outcome
+	if d.verdict == reject {
+		out = outcome{status: "failed", err: errors.New(d.reason)}
+	} else {
+		out = x.run(ctx, job, e)
+	}
 	if err := finish(ctx, job, e, out); err != nil {
 		slog.ErrorContext(ctx, "worker.finish_failed", "error", err)
 		return
@@ -84,6 +98,20 @@ func (x *Executor) Handle(ctx context.Context, job *Job) {
 	span.SetAttributes(attribute.String("migration.status", out.status), attribute.Int64("migration.rows", out.rows))
 	logAttempt(ctx, "migration.attempt.end", job, e, out.status, out.err, slog.Float64("duration_ms", float64(time.Since(started).Microseconds())/1000),
 		slog.Int("batches_committed", out.batches), slog.Int64("rows_processed", out.rows))
+}
+
+// jeda sebelum job yang ditunda dicoba lagi
+const requeueDelay = 2
+
+func (x *Executor) revalidate(ctx context.Context, job *Job, e execution) (decision, error) {
+	ctx, span := telemetry.Tracer().Start(ctx, "worker.revalidate")
+	defer span.End()
+	d, err := revalidate(ctx, x.Pool, job, e)
+	span.SetAttributes(attribute.Int("revalidate.verdict", int(d.verdict)), attribute.String("revalidate.reason", d.reason))
+	if err != nil {
+		span.RecordError(err)
+	}
+	return d, err
 }
 
 func (x *Executor) run(ctx context.Context, job *Job, e execution) outcome {
