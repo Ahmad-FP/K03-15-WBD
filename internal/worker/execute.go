@@ -87,7 +87,20 @@ func (x *Executor) Handle(ctx context.Context, job *Job) {
 	} else {
 		out = x.run(ctx, job, e)
 	}
-	if err := finish(ctx, job, e, out); err != nil {
+	extra := []slog.Attr{slog.Float64("duration_ms", float64(time.Since(started).Microseconds())/1000),
+		slog.Int("batches_committed", out.batches), slog.Int64("rows_processed", out.rows)}
+
+	if transient(out.err) && e.Attempt < e.MaxAttempts {
+		// gangguan sementara: attempt ini ditutup failed, attempt berikutnya dijadwalkan dengan backoff
+		newID, delay, err := scheduleRetry(ctx, job, e, out)
+		if err != nil {
+			slog.ErrorContext(ctx, "worker.retry_schedule_failed", "error", err)
+			return
+		}
+		out.status = "failed"
+		extra = append(extra, slog.Bool("retry_scheduled", true), slog.Int64("next_execution_id", newID),
+			slog.Int("next_attempt", e.Attempt+1), slog.Float64("retry_after_s", delay.Seconds()))
+	} else if err := finish(ctx, job, e, out); err != nil {
 		slog.ErrorContext(ctx, "worker.finish_failed", "error", err)
 		return
 	}
@@ -96,8 +109,7 @@ func (x *Executor) Handle(ctx context.Context, job *Job) {
 		span.SetStatus(codes.Error, telemetry.Redact(out.err.Error()))
 	}
 	span.SetAttributes(attribute.String("migration.status", out.status), attribute.Int64("migration.rows", out.rows))
-	logAttempt(ctx, "migration.attempt.end", job, e, out.status, out.err, slog.Float64("duration_ms", float64(time.Since(started).Microseconds())/1000),
-		slog.Int("batches_committed", out.batches), slog.Int64("rows_processed", out.rows))
+	logAttempt(ctx, "migration.attempt.end", job, e, out.status, out.err, extra...)
 }
 
 // jeda sebelum job yang ditunda dicoba lagi
