@@ -85,6 +85,11 @@ func (w *Worker) process(ctx context.Context, job *Job) {
 	ctx, span := telemetry.Tracer().Start(ctx, "worker.job", trace.WithAttributes(
 		attribute.Int64("job.id", job.ID), attribute.Int64("execution.id", job.ExecutionID), attribute.Int64("database.id", job.DatabaseID)))
 	defer span.End()
+	// lock diambil saat claim (sebelum traceparent job diketahui); span ini menandai masa lock dipegang
+	// di dalam trace job, jadi rantai API → queue → worker → lock → batch/query utuh
+	ctx, lockSpan := telemetry.Tracer().Start(ctx, "worker.lock.held", trace.WithAttributes(
+		attribute.Int64("database.id", job.DatabaseID), attribute.Int("lock.space", lockSpace)))
+	defer lockSpan.End()
 	defer job.Release(ctx)
 	defer func() {
 		if r := recover(); r != nil {
