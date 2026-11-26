@@ -16,7 +16,6 @@ var (
 	ErrUnreachable = errors.New("database target tidak bisa dihubungi")
 )
 
-// buka koneksi ke database target pakai DSN yang disimpan admin
 func Connect(ctx context.Context, app *pgxpool.Pool, id int64) (*pgx.Conn, error) {
 	var encrypted []byte
 	err := app.QueryRow(ctx, `SELECT encrypted_dsn FROM managed_databases WHERE id=$1`, id).Scan(&encrypted)
@@ -43,12 +42,10 @@ func Connect(ctx context.Context, app *pgxpool.Pool, id int64) (*pgx.Conn, error
 	return conn, nil
 }
 
-// enkripsi DSN dengan kunci yang sama seperti saat admin menyimpan database (dipakai test worker)
 func EncryptDSN(dsn string) ([]byte, error) {
 	return encryptDSN(dsn)
 }
 
-// ambil nama database buat judul halaman
 func Name(ctx context.Context, app *pgxpool.Pool, id int64) (string, error) {
 	var name string
 	err := app.QueryRow(ctx, `SELECT name FROM managed_databases WHERE id=$1`, id).Scan(&name)
@@ -58,7 +55,6 @@ func Name(ctx context.Context, app *pgxpool.Pool, id int64) (string, error) {
 	return name, err
 }
 
-// status dan pesan error koneksi yang ga bocorin detail credential
 func ConnectStatus(err error) (int, string) {
 	switch {
 	case errors.Is(err, ErrNotFound):
@@ -69,7 +65,6 @@ func ConnectStatus(err error) (int, string) {
 	return http.StatusInternalServerError, "terjadi kesalahan saat membuka database target"
 }
 
-// tulis error koneksi sebagai response polos
 func ConnectError(w http.ResponseWriter, err error) {
 	status, msg := ConnectStatus(err)
 	http.Error(w, msg, status)

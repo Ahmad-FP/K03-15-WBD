@@ -25,11 +25,6 @@ var (
 	ErrNotLeader       = &Error{http.StatusForbidden, "hanya group leader yang dapat menyetujui atau menolak migration"}
 )
 
-type queryer interface {
-	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}
-
 type Execution struct {
 	ID                  int64      `json:"id"`
 	RequestID           *int64     `json:"request_id"`
@@ -67,7 +62,7 @@ type ExecutionDetail struct {
 	LatestExecutionID int64      `json:"latest_execution_id"`
 	JobID             *int64     `json:"job_id"`
 	JobStatus         *string    `json:"job_status"`
-	Approvals         []Approval `json:"approvals"`
+	Approvals         []Approval `json:"approvals" db:"-"`
 }
 
 type headState struct {
@@ -107,23 +102,12 @@ func ListExecutions(ctx context.Context, pool *pgxpool.Pool, dbID int64, hideRol
 				AND r.status = 'success' AND r.reverted_execution_id IS NOT NULL
 				AND (e.id = r.id OR e.id = r.reverted_execution_id))`
 	}
-	q += ` ORDER BY e.id DESC`
-	rows, err := pool.Query(ctx, q, dbID)
-	if err != nil {
-		return nil, err
-	}
-	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Execution])
-	if list == nil {
-		list = []Execution{}
-	}
-	return list, err
+	return httpx.Collect[Execution](ctx, pool, q+` ORDER BY e.id DESC`, dbID)
 }
 
 func GetExecution(ctx context.Context, pool *pgxpool.Pool, dbID, eid int64) (ExecutionDetail, error) {
-	var d ExecutionDetail
-	var reqID int64
-	err := pool.QueryRow(ctx, `SELECT `+selectExecutionCols+`,
-			e.sql_snapshot, e.last_cursor, latest.id, j.id, j.status, COALESCE(e.request_id, e.id)
+	rows, err := pool.Query(ctx, `SELECT `+selectExecutionCols+`,
+			e.sql_snapshot, e.last_cursor, latest.id, j.id, j.status
 		FROM migration_executions e
 		JOIN migrations m ON m.id = e.migration_id
 		LEFT JOIN users u ON u.id = e.requested_by
@@ -132,20 +116,22 @@ func GetExecution(ctx context.Context, pool *pgxpool.Pool, dbID, eid int64) (Exe
 			WHERE x.database_id = e.database_id AND COALESCE(x.request_id, x.id) = COALESCE(e.request_id, e.id)
 		) latest
 		LEFT JOIN migration_jobs j ON j.execution_id = latest.id
-		WHERE e.database_id = $1 AND e.id = $2`, dbID, eid).Scan(
-		&d.ID, &d.RequestID, &d.MigrationID, &d.MigrationName, &d.Version, &d.Operation, &d.Attempt,
-		&d.Status, &d.RevertedExecutionID, &d.ParentExecutionID, &d.BatchesCommitted, &d.RowsProcessed,
-		&d.Error, &d.RequestedByUsername, &d.CreatedAt, &d.StartedAt, &d.FinishedAt,
-		&d.SQLSnapshot, &d.LastCursor, &d.LatestExecutionID, &d.JobID, &d.JobStatus, &reqID,
-	)
+		WHERE e.database_id = $1 AND e.id = $2`, dbID, eid)
+	if err != nil {
+		return ExecutionDetail{}, err
+	}
+	d, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[ExecutionDetail])
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ExecutionDetail{}, ErrExecNotFound
 	}
 	if err != nil {
 		return ExecutionDetail{}, err
 	}
-
-	rows, err := pool.Query(ctx, `SELECT ap.group_id, g.name, g.leader_id, l.username,
+	reqID := d.ID
+	if d.RequestID != nil {
+		reqID = *d.RequestID
+	}
+	d.Approvals, err = httpx.Collect[Approval](ctx, pool, `SELECT ap.group_id, g.name, g.leader_id, l.username,
 			ap.status, du.username, ap.decided_at
 		FROM migration_approvals ap
 		JOIN platform_groups g ON g.id = ap.group_id
@@ -153,177 +139,133 @@ func GetExecution(ctx context.Context, pool *pgxpool.Pool, dbID, eid int64) (Exe
 		LEFT JOIN users du ON du.id = ap.decided_by
 		WHERE ap.execution_id = $1
 		ORDER BY g.name`, reqID)
-	if err != nil {
-		return ExecutionDetail{}, err
-	}
-	d.Approvals, err = pgx.CollectRows(rows, pgx.RowToStructByPos[Approval])
-	if d.Approvals == nil {
-		d.Approvals = []Approval{}
-	}
 	return d, err
 }
 
 func Submit(ctx context.Context, pool *pgxpool.Pool, dbID, mid, userID int64) (int64, error) {
-	tx, err := beginDatabaseTx(ctx, pool, dbID)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx)
-
-	m, err := lockMigration(ctx, tx, dbID, mid)
-	if err != nil {
-		return 0, err
-	}
-	if err := checkGroupLeaders(ctx, tx, dbID); err != nil {
-		return 0, err
-	}
-	if unresolved, err := hasUnresolved(ctx, tx, dbID, mid); err != nil {
-		return 0, err
-	} else if unresolved {
-		return 0, ErrInvalidState
-	}
-
-	head, err := activeHead(ctx, tx, dbID)
-	if err != nil {
-		return 0, err
-	}
-	if m.Version <= head.Version {
-		return 0, ErrInvalidOrder
-	}
-
-	everSuccess, err := everSucceeded(ctx, tx, mid)
-	if err != nil {
-		return 0, err
-	}
-	op := "up"
-	if !everSuccess {
-		var hasDraft bool
-		err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM migrations w
-			WHERE w.database_id = $1 AND w.version > $2 AND w.version < $3
-				AND NOT EXISTS (SELECT 1 FROM migration_executions x WHERE x.migration_id = w.id))`,
-			dbID, head.Version, m.Version).Scan(&hasDraft)
+	return withDatabaseTx(ctx, pool, dbID, func(tx pgx.Tx) (int64, error) {
+		m, err := lockMigration(ctx, tx, dbID, mid)
 		if err != nil {
 			return 0, err
 		}
-		if hasDraft {
-			return 0, ErrInvalidOrder
+		if err := checkGroupLeaders(ctx, tx, dbID); err != nil {
+			return 0, err
 		}
-	} else {
-		op = "forward"
-		blocked, err := hasBlockedRolledBackBetween(ctx, tx, dbID, head.Version, m.Version)
+		if unresolved, err := hasUnresolved(ctx, tx, dbID); err != nil || unresolved {
+			if err != nil {
+				return 0, err
+			}
+			return 0, ErrInvalidState
+		}
+		head, err := activeHead(ctx, tx, dbID)
 		if err != nil {
 			return 0, err
 		}
-		if blocked {
+		if m.Version <= head.Version {
 			return 0, ErrInvalidOrder
 		}
-	}
-
-	eid, err := createExecution(ctx, tx, dbID, m.ID, m.Version, op, m.SQLUp, nil, nil, userID)
-	if err != nil {
-		return 0, err
-	}
-	return eid, tx.Commit(ctx)
+		everSuccess, err := everSucceeded(ctx, tx, mid)
+		if err != nil {
+			return 0, err
+		}
+		op := "up"
+		if !everSuccess {
+			hasDraft, err := exists(ctx, tx, `SELECT EXISTS (SELECT 1 FROM migrations w
+				WHERE w.database_id = $1 AND w.version > $2 AND w.version < $3
+					AND NOT EXISTS (SELECT 1 FROM migration_executions x WHERE x.migration_id = w.id))`,
+				dbID, head.Version, m.Version)
+			if err != nil {
+				return 0, err
+			}
+			if hasDraft {
+				return 0, ErrInvalidOrder
+			}
+		} else {
+			op = "forward"
+			blocked, err := hasBlockedRolledBackBetween(ctx, tx, dbID, head.Version, m.Version)
+			if err != nil {
+				return 0, err
+			}
+			if blocked {
+				return 0, ErrInvalidOrder
+			}
+		}
+		return createExecution(ctx, tx, dbID, m.ID, m.Version, op, m.SQLUp, nil, nil, userID)
+	})
 }
 
 func Rollback(ctx context.Context, pool *pgxpool.Pool, dbID, mid, userID int64) (int64, error) {
-	tx, err := beginDatabaseTx(ctx, pool, dbID)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx)
-
-	m, err := lockMigration(ctx, tx, dbID, mid)
-	if err != nil {
-		return 0, err
-	}
-	if err := checkGroupLeaders(ctx, tx, dbID); err != nil {
-		return 0, err
-	}
-	head, err := activeHead(ctx, tx, dbID)
-	if err != nil {
-		return 0, err
-	}
-	if head.ActiveID == 0 || m.ID != head.MigrationID || m.Version != head.Version {
-		return 0, ErrInvalidOrder
-	}
-	if !isReversible(m) {
-		return 0, ErrIrreversible
-	}
-	if unresolved, err := hasUnresolved(ctx, tx, dbID, mid); err != nil {
-		return 0, err
-	} else if unresolved {
-		return 0, ErrInvalidState
-	}
-
-	eid, err := createExecution(ctx, tx, dbID, m.ID, m.Version, "rollback", m.SQLDown, &head.ActiveID, &head.RootID, userID)
-	if err != nil {
-		return 0, err
-	}
-	return eid, tx.Commit(ctx)
-}
-
-func Retry(ctx context.Context, pool *pgxpool.Pool, dbID, eid, userID int64) (int64, error) {
-	return submitRecovery(ctx, pool, dbID, eid, userID, "retry")
-}
-
-func Compensate(ctx context.Context, pool *pgxpool.Pool, dbID, eid, userID int64) (int64, error) {
-	return submitRecovery(ctx, pool, dbID, eid, userID, "compensate")
-}
-
-func submitRecovery(ctx context.Context, pool *pgxpool.Pool, dbID, eid, userID int64, op string) (int64, error) {
-	tx, err := beginDatabaseTx(ctx, pool, dbID)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx)
-
-	var mid, rootID int64
-	var version int
-	var status string
-	var targetReverted *int64
-	err = tx.QueryRow(ctx, `SELECT migration_id, version, status, reverted_execution_id, COALESCE(parent_execution_id, request_id, id)
-		FROM migration_executions WHERE database_id = $1 AND id = $2`, dbID, eid).
-		Scan(&mid, &version, &status, &targetReverted, &rootID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, ErrExecNotFound
-	}
-	if err != nil {
-		return 0, err
-	}
-	if err := checkGroupLeaders(ctx, tx, dbID); err != nil {
-		return 0, err
-	}
-	if op == "retry" && status != "partial" {
-		return 0, ErrInvalidState
-	}
-	var unresolved bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM (`+unresolvedRowsSQL+`) u WHERE u.id = $2)`, dbID, eid).Scan(&unresolved); err != nil {
-		return 0, err
-	}
-	if !unresolved {
-		return 0, ErrInvalidState
-	}
-
-	m, err := lockMigration(ctx, tx, dbID, mid)
-	if err != nil {
-		return 0, err
-	}
-	sqlSnapshot := m.SQLUp
-	var revertedID *int64
-	if op == "compensate" {
+	return withDatabaseTx(ctx, pool, dbID, func(tx pgx.Tx) (int64, error) {
+		m, err := lockMigration(ctx, tx, dbID, mid)
+		if err != nil {
+			return 0, err
+		}
+		if err := checkGroupLeaders(ctx, tx, dbID); err != nil {
+			return 0, err
+		}
+		head, err := activeHead(ctx, tx, dbID)
+		if err != nil {
+			return 0, err
+		}
+		if head.ActiveID == 0 || m.ID != head.MigrationID || m.Version != head.Version {
+			return 0, ErrInvalidOrder
+		}
 		if !isReversible(m) {
 			return 0, ErrIrreversible
 		}
-		sqlSnapshot = m.SQLDown
-		revertedID = targetReverted
-	}
+		if unresolved, err := hasUnresolved(ctx, tx, dbID); err != nil || unresolved {
+			if err != nil {
+				return 0, err
+			}
+			return 0, ErrInvalidState
+		}
+		return createExecution(ctx, tx, dbID, m.ID, m.Version, "rollback", m.SQLDown, &head.ActiveID, &head.RootID, userID)
+	})
+}
 
-	newID, err := createExecution(ctx, tx, dbID, mid, version, op, sqlSnapshot, revertedID, &rootID, userID)
-	if err != nil {
-		return 0, err
-	}
-	return newID, tx.Commit(ctx)
+func submitRecovery(ctx context.Context, pool *pgxpool.Pool, dbID, eid, userID int64, op string) (int64, error) {
+	return withDatabaseTx(ctx, pool, dbID, func(tx pgx.Tx) (int64, error) {
+		var mid, rootID int64
+		var version int
+		var status string
+		var targetReverted *int64
+		err := tx.QueryRow(ctx, `SELECT migration_id, version, status, reverted_execution_id, COALESCE(parent_execution_id, request_id, id)
+			FROM migration_executions WHERE database_id = $1 AND id = $2`, dbID, eid).
+			Scan(&mid, &version, &status, &targetReverted, &rootID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrExecNotFound
+		}
+		if err != nil {
+			return 0, err
+		}
+		if err := checkGroupLeaders(ctx, tx, dbID); err != nil {
+			return 0, err
+		}
+		if op == "retry" && status != "partial" {
+			return 0, ErrInvalidState
+		}
+		unresolved, err := exists(ctx, tx, `SELECT EXISTS (SELECT 1 FROM (`+unresolvedRowsSQL+`) u WHERE u.id = $2)`, dbID, eid)
+		if err != nil {
+			return 0, err
+		}
+		if !unresolved {
+			return 0, ErrInvalidState
+		}
+		m, err := lockMigration(ctx, tx, dbID, mid)
+		if err != nil {
+			return 0, err
+		}
+		sqlSnapshot := m.SQLUp
+		var revertedID *int64
+		if op == "compensate" {
+			if !isReversible(m) {
+				return 0, ErrIrreversible
+			}
+			sqlSnapshot = m.SQLDown
+			revertedID = targetReverted
+		}
+		return createExecution(ctx, tx, dbID, mid, version, op, sqlSnapshot, revertedID, &rootID, userID)
+	})
 }
 
 func Approve(ctx context.Context, pool *pgxpool.Pool, dbID, eid, userID int64, decision string) error {
@@ -334,24 +276,19 @@ func Approve(ctx context.Context, pool *pgxpool.Pool, dbID, eid, userID int64, d
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.WithoutCancel(ctx))
 
 	var reqID int64
 	var status string
-	err = tx.QueryRow(ctx, `SELECT COALESCE(request_id, id), status
-		FROM migration_executions WHERE database_id = $1 AND id = $2 FOR UPDATE`, dbID, eid).
-		Scan(&reqID, &status)
+	var isLeader bool
+	err = tx.QueryRow(ctx, `SELECT COALESCE(e.request_id, e.id), e.status,
+			EXISTS (SELECT 1 FROM migration_approvals ap JOIN platform_groups g ON g.id = ap.group_id
+				WHERE ap.execution_id = COALESCE(e.request_id, e.id) AND g.leader_id = $3)
+		FROM migration_executions e WHERE e.database_id = $1 AND e.id = $2 FOR UPDATE`, dbID, eid, userID).
+		Scan(&reqID, &status, &isLeader)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrExecNotFound
 	}
-	if err != nil {
-		return err
-	}
-
-	var isLeader bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM migration_approvals ap
-		JOIN platform_groups g ON g.id = ap.group_id
-		WHERE ap.execution_id = $1 AND g.leader_id = $2)`, reqID, userID).Scan(&isLeader)
 	if err != nil {
 		return err
 	}
@@ -387,81 +324,69 @@ func Approve(ctx context.Context, pool *pgxpool.Pool, dbID, eid, userID int64, d
 }
 
 func Cancel(ctx context.Context, pool *pgxpool.Pool, dbID, eid int64) error {
-	tag, err := pool.Exec(ctx, `UPDATE migration_executions SET status = 'rejected', finished_at = now()
-		WHERE database_id = $1 AND id = $2 AND status IN ('pending_review', 'approved')`, dbID, eid)
+	var status string
+	err := pool.QueryRow(ctx, `WITH old AS (
+			SELECT id, status FROM migration_executions WHERE database_id = $1 AND id = $2 FOR UPDATE
+		), upd AS (
+			UPDATE migration_executions SET status = 'rejected', finished_at = now()
+			WHERE id IN (SELECT id FROM old WHERE status IN ('pending_review', 'approved'))
+		)
+		SELECT status FROM old`, dbID, eid).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrExecNotFound
+	}
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() > 0 {
-		return nil
+	if status != "pending_review" && status != "approved" {
+		return ErrInvalidState
 	}
-	var exists bool
-	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM migration_executions WHERE database_id = $1 AND id = $2)`, dbID, eid).Scan(&exists); err != nil {
-		return err
-	}
-	if !exists {
-		return ErrExecNotFound
-	}
-	return ErrInvalidState
+	return nil
 }
 
 func Enqueue(ctx context.Context, pool *pgxpool.Pool, dbID, eid int64) (int64, error) {
-	tx, err := beginDatabaseTx(ctx, pool, dbID)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx)
-
-	var version int
-	var op string
-	err = tx.QueryRow(ctx, `SELECT version, operation FROM migration_executions
-		WHERE database_id = $1 AND id = $2`, dbID, eid).Scan(&version, &op)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, ErrExecNotFound
-	}
-	if err != nil {
-		return 0, err
-	}
-	if op == "up" || op == "forward" {
-		head, err := activeHead(ctx, tx, dbID)
+	return withDatabaseTx(ctx, pool, dbID, func(tx pgx.Tx) (int64, error) {
+		var version int
+		var op string
+		err := tx.QueryRow(ctx, `SELECT version, operation FROM migration_executions
+			WHERE database_id = $1 AND id = $2`, dbID, eid).Scan(&version, &op)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrExecNotFound
+		}
 		if err != nil {
 			return 0, err
 		}
-		var unqueued bool
-		err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM migration_executions
-			WHERE database_id = $1 AND version > $2 AND version < $3 AND status IN ('pending_review', 'approved'))`,
-			dbID, head.Version, version).Scan(&unqueued)
-		if err != nil {
-			return 0, err
+		if op == "up" || op == "forward" {
+			head, err := activeHead(ctx, tx, dbID)
+			if err != nil {
+				return 0, err
+			}
+			unqueued, err := exists(ctx, tx, `SELECT EXISTS (SELECT 1 FROM migration_executions
+				WHERE database_id = $1 AND version > $2 AND version < $3 AND status IN ('pending_review', 'approved'))`,
+				dbID, head.Version, version)
+			if err != nil {
+				return 0, err
+			}
+			if unqueued {
+				return 0, ErrInvalidOrder
+			}
 		}
-		if unqueued {
-			return 0, ErrInvalidOrder
+		jobID, err := queue.Enqueue(ctx, tx, dbID, eid, telemetry.TraceParent(ctx))
+		if errors.Is(err, queue.ErrNotApproved) {
+			return 0, ErrInvalidState
 		}
-	}
-
-	jobID, err := queue.Enqueue(ctx, tx, dbID, eid, telemetry.TraceParent(ctx))
-	if errors.Is(err, queue.ErrNotApproved) {
-		return 0, ErrInvalidState
-	}
-	if err != nil {
-		return 0, err
-	}
-	return jobID, tx.Commit(ctx)
+		return jobID, err
+	})
 }
 
-func migrationActions(ctx context.Context, q queryer, dbID int64, m Migration) (canRollback, canForward bool, err error) {
-	var inFlight bool
-	if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM migration_executions
-		WHERE migration_id = $1 AND status IN ('pending_review', 'approved', 'pending', 'running'))`, m.ID).Scan(&inFlight); err != nil {
+func migrationActions(ctx context.Context, q httpx.Queryer, dbID int64, m Migration) (canRollback, canForward bool, err error) {
+	if inFlight, err := exists(ctx, q, `SELECT EXISTS (SELECT 1 FROM migration_executions
+		WHERE migration_id = $1 AND status IN ('pending_review', 'approved', 'pending', 'running'))`, m.ID); err != nil || inFlight {
 		return false, false, err
 	}
-	if inFlight {
-		return false, false, nil
-	}
-	if unresolved, err := hasUnresolved(ctx, q, dbID, m.ID); err != nil || unresolved {
+	if unresolved, err := hasUnresolved(ctx, q, dbID); err != nil || unresolved {
 		return false, false, err
 	}
-
 	head, err := activeHead(ctx, q, dbID)
 	if err != nil {
 		return false, false, err
@@ -483,38 +408,51 @@ func migrationActions(ctx context.Context, q queryer, dbID int64, m Migration) (
 	return canRollback, canForward, nil
 }
 
-func beginDatabaseTx(ctx context.Context, pool *pgxpool.Pool, dbID int64) (pgx.Tx, error) {
+func withDatabaseTx[T any](ctx context.Context, pool *pgxpool.Pool, dbID int64, fn func(pgx.Tx) (T, error)) (T, error) {
+	var zero T
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+
 	var locked int64
-	err = tx.QueryRow(ctx, `SELECT id FROM managed_databases WHERE id = $1 FOR UPDATE`, dbID).Scan(&locked)
-	if err != nil {
-		tx.Rollback(ctx)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, err
+	if err := tx.QueryRow(ctx, `SELECT id FROM managed_databases WHERE id = $1 FOR UPDATE`, dbID).Scan(&locked); errors.Is(err, pgx.ErrNoRows) {
+		return zero, ErrNotFound
+	} else if err != nil {
+		return zero, err
 	}
-	return tx, nil
+	v, err := fn(tx)
+	if err != nil {
+		return zero, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return zero, err
+	}
+	return v, nil
 }
 
-func checkGroupLeaders(ctx context.Context, q queryer, dbID int64) error {
-	var missing bool
-	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM group_database_access a
-		JOIN platform_groups g ON g.id = a.group_id
-		WHERE a.database_id = $1 AND g.leader_id IS NULL)`, dbID).Scan(&missing)
+func exists(ctx context.Context, q httpx.Queryer, sql string, args ...any) (bool, error) {
+	var ok bool
+	err := q.QueryRow(ctx, sql, args...).Scan(&ok)
+	return ok, err
+}
+
+func checkGroupLeaders(ctx context.Context, q httpx.Queryer, dbID int64) error {
+	var total, missing int
+	err := q.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE g.leader_id IS NULL)
+		FROM group_database_access a JOIN platform_groups g ON g.id = a.group_id
+		WHERE a.database_id = $1`, dbID).Scan(&total, &missing)
 	if err != nil {
 		return err
 	}
-	if missing {
+	if total == 0 || missing > 0 {
 		return ErrMissingLeader
 	}
 	return nil
 }
 
-func lockMigration(ctx context.Context, q queryer, dbID, mid int64) (Migration, error) {
+func lockMigration(ctx context.Context, q httpx.Queryer, dbID, mid int64) (Migration, error) {
 	var m Migration
 	err := q.QueryRow(ctx, `SELECT id, version, sql, sql_down, irreversible_reason
 		FROM migrations WHERE database_id = $1 AND id = $2 FOR UPDATE`, dbID, mid).
@@ -525,7 +463,7 @@ func lockMigration(ctx context.Context, q queryer, dbID, mid int64) (Migration, 
 	return m, err
 }
 
-func activeHead(ctx context.Context, q queryer, dbID int64) (headState, error) {
+func activeHead(ctx context.Context, q httpx.Queryer, dbID int64) (headState, error) {
 	var h headState
 	err := q.QueryRow(ctx, `WITH active AS (`+activeRowsSQL+`)
 		SELECT version, id, migration_id, root_id FROM active ORDER BY version DESC, id DESC LIMIT 1`, dbID).
@@ -536,22 +474,17 @@ func activeHead(ctx context.Context, q queryer, dbID int64) (headState, error) {
 	return h, err
 }
 
-func everSucceeded(ctx context.Context, q queryer, mid int64) (bool, error) {
-	var ok bool
-	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM migration_executions
-		WHERE migration_id = $1 AND operation IN ('up', 'forward', 'retry') AND status = 'success')`, mid).Scan(&ok)
-	return ok, err
+func everSucceeded(ctx context.Context, q httpx.Queryer, mid int64) (bool, error) {
+	return exists(ctx, q, `SELECT EXISTS (SELECT 1 FROM migration_executions
+		WHERE migration_id = $1 AND operation IN ('up', 'forward', 'retry') AND status = 'success')`, mid)
 }
 
-func hasUnresolved(ctx context.Context, q queryer, dbID, mid int64) (bool, error) {
-	var exists bool
-	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM (`+unresolvedRowsSQL+`) u WHERE u.migration_id = $2)`, dbID, mid).Scan(&exists)
-	return exists, err
+func hasUnresolved(ctx context.Context, q httpx.Queryer, dbID int64) (bool, error) {
+	return exists(ctx, q, `SELECT EXISTS (SELECT 1 FROM (`+unresolvedRowsSQL+`) u)`, dbID)
 }
 
-func hasBlockedRolledBackBetween(ctx context.Context, q queryer, dbID int64, headVersion, targetVersion int) (bool, error) {
-	var blocked bool
-	err := q.QueryRow(ctx, `WITH active AS (`+activeRowsSQL+`)
+func hasBlockedRolledBackBetween(ctx context.Context, q httpx.Queryer, dbID int64, headVersion, targetVersion int) (bool, error) {
+	return exists(ctx, q, `WITH active AS (`+activeRowsSQL+`)
 		SELECT EXISTS (
 			SELECT 1 FROM migrations w
 			WHERE w.database_id = $1 AND w.version > $2 AND w.version < $3
@@ -561,25 +494,25 @@ func hasBlockedRolledBackBetween(ctx context.Context, q queryer, dbID int64, hea
 				AND NOT EXISTS (SELECT 1 FROM migration_executions f
 					WHERE f.migration_id = w.id AND f.operation = 'forward'
 						AND f.status IN ('pending_review', 'approved', 'pending', 'running'))
-		)`, dbID, headVersion, targetVersion).Scan(&blocked)
-	return blocked, err
+		)`, dbID, headVersion, targetVersion)
 }
 
 func createExecution(ctx context.Context, tx pgx.Tx, dbID, mid int64, version int, op, sqlSnapshot string, revertedID, parentID *int64, userID int64) (int64, error) {
 	var eid int64
-	err := tx.QueryRow(ctx, `INSERT INTO migration_executions
-			(migration_id, database_id, version, operation, sql_snapshot, status, reverted_execution_id, parent_execution_id, requested_by)
-		VALUES ($1, $2, $3, $4, $5, 'pending_review', $6, $7, $8)
-		RETURNING id`,
+	err := tx.QueryRow(ctx, `WITH e AS (
+			INSERT INTO migration_executions
+				(migration_id, database_id, version, operation, sql_snapshot, status, reverted_execution_id, parent_execution_id, requested_by)
+			VALUES ($1, $2, $3, $4, $5, 'pending_review', $6, $7, $8)
+			RETURNING id
+		), a AS (
+			INSERT INTO migration_approvals (execution_id, group_id)
+			SELECT e.id, group_id FROM e, group_database_access WHERE database_id = $2
+		)
+		SELECT id FROM e`,
 		mid, dbID, version, op, sqlSnapshot, revertedID, parentID, userID).Scan(&eid)
 	if httpx.IsPGCode(err, "23505") {
 		return 0, ErrInFlight
 	}
-	if err != nil {
-		return 0, err
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO migration_approvals (execution_id, group_id)
-		SELECT $1, group_id FROM group_database_access WHERE database_id = $2`, eid, dbID)
 	return eid, err
 }
 

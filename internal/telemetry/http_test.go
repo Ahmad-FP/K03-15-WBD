@@ -2,7 +2,9 @@ package telemetry
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -34,7 +36,8 @@ func TestMiddlewareSpanAndLog(t *testing.T) {
 	var traceParent string
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/databases/{id}/executions/{eid}/enqueue", func(w http.ResponseWriter, r *http.Request) {
-		traceParent = TraceParent(r.Context()) // yang disimpan Track 2 ke queue
+		SetRequestActor(r.Context(), "ani")
+		traceParent = TraceParent(r.Context())
 		w.WriteHeader(http.StatusAccepted)
 	})
 	req := httptest.NewRequest("POST", "/api/databases/3/executions/9/enqueue", nil)
@@ -52,8 +55,29 @@ func TestMiddlewareSpanAndLog(t *testing.T) {
 	}
 	var rec map[string]any
 	json.Unmarshal(buf.Bytes(), &rec)
-	if rec["msg"] != "http.request" || rec["status"] != float64(202) || rec["path"] != "/api/databases/3/executions/9/enqueue" {
+	if rec["msg"] != "http.request" || rec["status"] != float64(202) || rec["path"] != "/api/databases/3/executions/9/enqueue" || rec["actor"] != "ani" {
 		t.Fatalf("log request = %v", rec)
+	}
+}
+
+func TestRecordErrorRedactsSpan(t *testing.T) {
+	spans := memoryTracer(t)
+	_, span := Tracer().Start(context.Background(), "op")
+	RecordError(span, errors.New("dial postgres://u:topsecret@db:5432/x gagal"))
+	span.End()
+	ended := spans.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("span count = %d", len(ended))
+	}
+	if strings.Contains(ended[0].Status().Description, "topsecret") {
+		t.Fatalf("span status bocor rahasia: %s", ended[0].Status().Description)
+	}
+	for _, ev := range ended[0].Events() {
+		for _, attr := range ev.Attributes {
+			if strings.Contains(attr.Value.AsString(), "topsecret") {
+				t.Fatalf("span event bocor rahasia: %s=%s", attr.Key, attr.Value.AsString())
+			}
+		}
 	}
 }
 

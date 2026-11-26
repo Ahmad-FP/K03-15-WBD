@@ -11,15 +11,7 @@ import (
 )
 
 func encryptDSN(plain string) ([]byte, error) {
-	key, err := encryptionKey()
-	if err != nil {
-		return nil, err
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
+	gcm, err := gcmCipher()
 	if err != nil {
 		return nil, err
 	}
@@ -29,27 +21,20 @@ func encryptDSN(plain string) ([]byte, error) {
 	}
 	return gcm.Seal(nonce, nonce, []byte(plain), nil), nil
 }
+
 func decryptDSN(ciphertext []byte) (string, error) {
-	key, err := encryptionKey()
-	if err != nil {
-		return "", err
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", err
-	}
-	gcm, err := cipher.NewGCM(block)
+	gcm, err := gcmCipher()
 	if err != nil {
 		return "", err
 	}
 	if len(ciphertext) < gcm.NonceSize() {
 		return "", errors.New("encrypted credential invalid")
 	}
-	nonce := ciphertext[:gcm.NonceSize()]
-	plain, err := gcm.Open(nil, nonce, ciphertext[gcm.NonceSize():], nil)
+	plain, err := gcm.Open(nil, ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():], nil)
 	return string(plain), err
 }
-func encryptionKey() ([]byte, error) {
+
+func gcmCipher() (cipher.AEAD, error) {
 	raw := os.Getenv("DATABASE_CREDENTIALS_KEY")
 	if len(raw) != 64 {
 		return nil, errors.New("DATABASE_CREDENTIALS_KEY harus berisi 64 karakter hex")
@@ -58,5 +43,9 @@ func encryptionKey() ([]byte, error) {
 	if err != nil || len(key) != 32 {
 		return nil, errors.New("DATABASE_CREDENTIALS_KEY tidak valid")
 	}
-	return key, nil
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
 }

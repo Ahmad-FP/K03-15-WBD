@@ -67,16 +67,16 @@ func scheduleRetry(ctx context.Context, job *Job, e execution, out outcome) (new
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 
-	if _, err := tx.Exec(ctx, `UPDATE migration_executions SET status = 'failed', error = $2, batches_committed = $3, rows_processed = $4, finished_at = now()
-		WHERE id = $1`, e.ID, telemetry.Redact(out.err.Error()), out.batches, out.rows); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE migration_executions SET status = 'failed', error = $2, batches_committed = $3, rows_processed = $4, last_cursor = $5, finished_at = now()
+		WHERE id = $1`, e.ID, telemetry.Redact(out.err.Error()), out.batches, out.rows, out.cursor); err != nil {
 		return 0, 0, err
 	}
 	err = tx.QueryRow(ctx, `INSERT INTO migration_executions (request_id, migration_id, database_id, version, operation, attempt, sql_snapshot,
 			status, reverted_execution_id, parent_execution_id, batches_committed, rows_processed, last_cursor, requested_by)
 		SELECT COALESCE(request_id, id), migration_id, database_id, version, operation, attempt + 1, sql_snapshot,
-			'pending', reverted_execution_id, parent_execution_id, $2, $3, last_cursor, requested_by
+			'pending', reverted_execution_id, parent_execution_id, $2, $3, $4, requested_by
 		FROM migration_executions WHERE id = $1
-		RETURNING id`, e.ID, out.batches, out.rows).Scan(&newID)
+		RETURNING id`, e.ID, out.batches, out.rows, out.cursor).Scan(&newID)
 	if err != nil {
 		return 0, 0, err
 	}

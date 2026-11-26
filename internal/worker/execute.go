@@ -11,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 )
 
 // tabel bukti commit di database target, ditulis di transaksi yang sama dengan SQL migration
@@ -29,17 +28,20 @@ var errTxEnded = errors.New("SQL migration menutup transaction sendiri, perubaha
 
 // data execution yang dibutuhkan untuk menjalankan satu attempt
 type execution struct {
-	ID          int64
-	ReqID       int64 // COALESCE(request_id, id): id pengajuan pertama, stabil lintas retry
-	RootID      int64 // COALESCE(parent_execution_id, request_id, id): pemilik checkpoint batch
-	MigrationID int64
-	Version     int
-	Operation   string
-	Attempt     int
-	SQL         string // sql_snapshot: salinan SQL yang benar-benar dijalankan
-	Actor       string
-	BatchSize   int
-	MaxAttempts int
+	ID               int64
+	ReqID            int64 // COALESCE(request_id, id): id pengajuan pertama, stabil lintas retry
+	RootID           int64 // COALESCE(parent_execution_id, request_id, id): pemilik checkpoint batch
+	MigrationID      int64
+	Version          int
+	Operation        string
+	Attempt          int
+	SQL              string // sql_snapshot: salinan SQL yang benar-benar dijalankan
+	Actor            string
+	BatchSize        int
+	MaxAttempts      int
+	BatchesCommitted int
+	RowsProcessed    int64
+	LastCursor       string
 }
 
 // hasil akhir satu attempt, ditulis ke migration_executions dan migration_jobs
@@ -48,6 +50,19 @@ type outcome struct {
 	err     error
 	batches int
 	rows    int64
+	cursor  string
+}
+
+// jaga status partial/partially_reverted dan progres yang sudah ter-commit kalau gagal sebelum loop batch
+func failedOutcome(e execution, err error) outcome {
+	if e.BatchSize > 0 && e.BatchesCommitted > 0 {
+		status := "partial"
+		if e.Operation == "rollback" || e.Operation == "compensate" {
+			status = "partially_reverted"
+		}
+		return outcome{status: status, err: err, batches: e.BatchesCommitted, rows: e.RowsProcessed, cursor: e.LastCursor}
+	}
+	return outcome{status: "failed", err: err}
 }
 
 // Handler worker: jalankan SQL migration di database target lalu catat hasilnya
@@ -83,7 +98,7 @@ func (x *Executor) Handle(ctx context.Context, job *Job) {
 	logAttempt(ctx, "migration.attempt.start", job, e, "running", nil)
 	var out outcome
 	if d.verdict == reject {
-		out = outcome{status: "failed", err: errors.New(d.reason)}
+		out = failedOutcome(e, errors.New(d.reason))
 	} else {
 		out = x.run(ctx, job, e)
 	}
@@ -105,8 +120,7 @@ func (x *Executor) Handle(ctx context.Context, job *Job) {
 		return
 	}
 	if out.err != nil {
-		span.RecordError(out.err)
-		span.SetStatus(codes.Error, telemetry.Redact(out.err.Error()))
+		telemetry.RecordError(span, out.err)
 	}
 	span.SetAttributes(attribute.String("migration.status", out.status), attribute.Int64("migration.rows", out.rows))
 	logAttempt(ctx, "migration.attempt.end", job, e, out.status, out.err, extra...)
@@ -121,7 +135,7 @@ func (x *Executor) revalidate(ctx context.Context, job *Job, e execution) (decis
 	d, err := revalidate(ctx, x.Pool, job, e)
 	span.SetAttributes(attribute.Int("revalidate.verdict", int(d.verdict)), attribute.String("revalidate.reason", d.reason))
 	if err != nil {
-		span.RecordError(err)
+		telemetry.RecordError(span, err)
 	}
 	return d, err
 }
@@ -129,7 +143,7 @@ func (x *Executor) revalidate(ctx context.Context, job *Job, e execution) (decis
 func (x *Executor) run(ctx context.Context, job *Job, e execution) outcome {
 	target, err := db.Connect(ctx, x.Pool, job.DatabaseID)
 	if err != nil {
-		return outcome{status: "failed", err: err}
+		return failedOutcome(e, err)
 	}
 	defer target.Close(context.WithoutCancel(ctx))
 	if e.BatchSize == 0 {
@@ -188,13 +202,13 @@ func runNormal(ctx context.Context, target *pgx.Conn, e execution) outcome {
 func loadExecution(ctx context.Context, pool *pgxpool.Pool, id int64) (execution, error) {
 	var e execution
 	err := pool.QueryRow(ctx, `SELECT e.id, COALESCE(e.request_id, e.id), COALESCE(e.parent_execution_id, e.request_id, e.id), e.migration_id, e.version, e.operation, e.attempt,
-			e.sql_snapshot, COALESCE(u.username, ''), m.batch_size, j.max_attempts
+			e.sql_snapshot, COALESCE(u.username, ''), m.batch_size, j.max_attempts, e.batches_committed, e.rows_processed, e.last_cursor
 		FROM migration_executions e
 		JOIN migrations m ON m.id = e.migration_id
 		JOIN migration_jobs j ON j.execution_id = e.id
 		LEFT JOIN users u ON u.id = e.requested_by
 		WHERE e.id = $1`, id).Scan(&e.ID, &e.ReqID, &e.RootID, &e.MigrationID, &e.Version, &e.Operation, &e.Attempt,
-		&e.SQL, &e.Actor, &e.BatchSize, &e.MaxAttempts)
+		&e.SQL, &e.Actor, &e.BatchSize, &e.MaxAttempts, &e.BatchesCommitted, &e.RowsProcessed, &e.LastCursor)
 	return e, err
 }
 
@@ -209,8 +223,8 @@ func finish(ctx context.Context, job *Job, e execution, out outcome) error {
 	if out.err != nil {
 		msg = telemetry.Redact(out.err.Error())
 	}
-	if _, err := tx.Exec(ctx, `UPDATE migration_executions SET status = $2, error = $3, batches_committed = $4, rows_processed = $5, finished_at = now()
-		WHERE id = $1`, e.ID, out.status, msg, out.batches, out.rows); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE migration_executions SET status = $2, error = $3, batches_committed = $4, rows_processed = $5, last_cursor = $6, finished_at = now()
+		WHERE id = $1`, e.ID, out.status, msg, out.batches, out.rows, out.cursor); err != nil {
 		return err
 	}
 	jobStatus := "done"

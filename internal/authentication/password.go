@@ -2,9 +2,11 @@ package authentication
 
 import "golang.org/x/crypto/bcrypt"
 
-func Hash(password string) string {
-	h, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	return string(h)
+var ErrPasswordTooLong = bcrypt.ErrPasswordTooLong
+
+func Hash(password string) (string, error) {
+	h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	return string(h), err
 }
 
 func Check(hash, password string) bool {

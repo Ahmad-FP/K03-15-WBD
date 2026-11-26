@@ -27,20 +27,8 @@ type Database struct {
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.DB.Query(r.Context(), `SELECT id, name, host_label, created_at FROM managed_databases ORDER BY name`)
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "gagal mengambil database")
-		return
-	}
-	out, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Database])
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "gagal membaca database")
-		return
-	}
-	if out == nil {
-		out = []Database{}
-	}
-	httpx.JSON(w, http.StatusOK, out)
+	httpx.WriteList[Database](w, r, h.DB, "gagal mengambil database",
+		`SELECT id, name, host_label, created_at FROM managed_databases ORDER BY name`)
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +113,7 @@ func (h *Handler) Test(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, status, msg)
 		return
 	}
-	defer conn.Close(ctx)
+	defer conn.Close(context.WithoutCancel(ctx))
 	if err := conn.Ping(ctx); err != nil {
 		httpx.Error(w, http.StatusBadGateway, "koneksi PostgreSQL gagal atau akses ditolak oleh server target")
 		return

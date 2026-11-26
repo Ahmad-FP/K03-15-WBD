@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from "react";
-import { apiRequest, ApiError } from "./api";
+import React, { useCallback, useEffect, useState } from "react";
+import { apiRequest, ApiError, setUnauthorizedHandler } from "./api";
 import { DatabaseSummary, User } from "./types";
 import { ViewerPanel } from "./components/ViewerPanel";
 import { MigrationsPanel } from "./components/MigrationsPanel";
@@ -24,39 +24,73 @@ export default function App() {
     null
   );
 
-  const notify = (text: string, isError = false) => {
+  const notify = useCallback((text: string, isError = false) => {
     setToast({ text, isError });
     window.setTimeout(() => {
       setToast((prev) => (prev?.text === text ? null : prev));
     }, 4500);
-  };
+  }, []);
 
-  const loadSessionAndDbs = async () => {
-    setCheckingAuth(true);
-    try {
-      const me = await apiRequest<User>("/api/auth/me");
-      setUser(me);
-      const dbs = await apiRequest<DatabaseSummary[]>("/api/databases");
-      setDatabases(dbs);
-      if (dbs.length > 0) {
-        setSelectedDbId((prev) =>
-          prev && dbs.some((d) => d.id === prev) ? prev : dbs[0].id
-        );
-      }
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        setUser(null);
-      } else {
-        setUser(null);
-      }
-    } finally {
-      setCheckingAuth(false);
-    }
-  };
+  const refreshDatabases = useCallback(async (): Promise<DatabaseSummary[]> => {
+    const dbs = await apiRequest<DatabaseSummary[]>("/api/databases");
+    setDatabases(dbs);
+    setSelectedDbId((prev) =>
+      prev && dbs.some((d) => d.id === prev) ? prev : (dbs[0]?.id ?? null)
+    );
+    return dbs;
+  }, []);
 
   useEffect(() => {
-    void loadSessionAndDbs();
+    setUnauthorizedHandler(() => {
+      setUser((prev) => {
+        if (prev !== null) {
+          setAuthError("Sesi berakhir atau dicabut, silakan masuk kembali.");
+        }
+        return null;
+      });
+      setDatabases([]);
+      setSelectedDbId(null);
+      setTab("migrations");
+    });
+    return () => setUnauthorizedHandler(null);
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    const loadSessionAndDbs = async () => {
+      setCheckingAuth(true);
+      try {
+        const me = await apiRequest<User>("/api/auth/me");
+        if (!active) return;
+        setUser(me);
+        try {
+          const dbs = await refreshDatabases();
+          if (active && me.is_admin && dbs.length === 0) {
+            setTab("admin");
+          }
+        } catch (err) {
+          if (active && !(err instanceof ApiError && err.status === 401)) {
+            notify(
+              err instanceof Error ? err.message : "Gagal memuat daftar database",
+              true
+            );
+          }
+        }
+      } catch (err) {
+        if (active && err instanceof ApiError && err.status === 401) {
+          setUser(null);
+        } else if (active) {
+          setUser(null);
+        }
+      } finally {
+        if (active) setCheckingAuth(false);
+      }
+    };
+    void loadSessionAndDbs();
+    return () => {
+      active = false;
+    };
+  }, [notify, refreshDatabases]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -68,9 +102,8 @@ export default function App() {
       });
       setUser(loggedIn);
       setPassword("");
-      const dbs = await apiRequest<DatabaseSummary[]>("/api/databases");
-      setDatabases(dbs);
-      if (dbs.length > 0) setSelectedDbId(dbs[0].id);
+      const dbs = await refreshDatabases();
+      setTab(loggedIn.is_admin && dbs.length === 0 ? "admin" : "migrations");
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : "Login gagal");
     }
@@ -79,10 +112,14 @@ export default function App() {
   const handleLogout = async () => {
     try {
       await apiRequest<void>("/api/auth/logout", { method: "POST" });
+    } catch {
+      // tetap bersihkan state lokal bila sesi sudah berakhir
     } finally {
       setUser(null);
       setDatabases([]);
       setSelectedDbId(null);
+      setTab("migrations");
+      setAuthError(null);
     }
   };
 
@@ -188,7 +225,7 @@ export default function App() {
             className={tab === "admin" ? "tab active" : "tab"}
             onClick={() => setTab("admin")}
           >
-            Admin (Users &amp; Groups)
+            Admin
           </button>
         )}
       </nav>
@@ -201,7 +238,12 @@ export default function App() {
 
       <main className="main-content">
         {tab === "admin" && user.is_admin ? (
-          <AdminPanel onNotify={notify} />
+          <AdminPanel
+            onNotify={notify}
+            onDatabasesChanged={() => {
+              void refreshDatabases().catch(() => {});
+            }}
+          />
         ) : activeDb ? (
           tab === "viewer" ? (
             <ViewerPanel dbId={activeDb.id} onNotify={notify} />

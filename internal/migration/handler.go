@@ -15,11 +15,7 @@ type Handler struct{ DB *pgxpool.Pool }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	list, err := List(r.Context(), h.DB, dbID(r))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	httpx.JSON(w, http.StatusOK, list)
+	respond(w, http.StatusOK, list, err)
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
@@ -28,11 +24,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m, err := Create(r.Context(), h.DB, dbID(r), session.Current(r).UserID, in)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	httpx.JSON(w, http.StatusCreated, m)
+	respond(w, http.StatusCreated, m, err)
 }
 
 func (h *Handler) Show(w http.ResponseWriter, r *http.Request) {
@@ -41,11 +33,7 @@ func (h *Handler) Show(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m, err := GetDetail(r.Context(), h.DB, dbID(r), mid)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	httpx.JSON(w, http.StatusOK, m)
+	respond(w, http.StatusOK, m, err)
 }
 
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
@@ -58,11 +46,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m, err := Update(r.Context(), h.DB, dbID(r), mid, in)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	httpx.JSON(w, http.StatusOK, m)
+	respond(w, http.StatusOK, m, err)
 }
 
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
@@ -70,20 +54,12 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := Delete(r.Context(), h.DB, dbID(r), mid); err != nil {
-		writeErr(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	respond(w, http.StatusNoContent, nil, Delete(r.Context(), h.DB, dbID(r), mid))
 }
 
 func (h *Handler) ListExecutions(w http.ResponseWriter, r *http.Request) {
 	list, err := ListExecutions(r.Context(), h.DB, dbID(r), r.URL.Query().Get("hide_rollback") == "true")
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	httpx.JSON(w, http.StatusOK, list)
+	respond(w, http.StatusOK, list, err)
 }
 
 func (h *Handler) ShowExecution(w http.ResponseWriter, r *http.Request) {
@@ -92,20 +68,22 @@ func (h *Handler) ShowExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	exec, err := GetExecution(r.Context(), h.DB, dbID(r), eid)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	httpx.JSON(w, http.StatusOK, exec)
+	respond(w, http.StatusOK, exec, err)
 }
 
 func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) { h.submitWith(w, r, "mid", Submit) }
 func (h *Handler) Rollback(w http.ResponseWriter, r *http.Request) {
 	h.submitWith(w, r, "mid", Rollback)
 }
-func (h *Handler) Retry(w http.ResponseWriter, r *http.Request) { h.submitWith(w, r, "eid", Retry) }
+func (h *Handler) Retry(w http.ResponseWriter, r *http.Request) {
+	h.submitWith(w, r, "eid", func(ctx context.Context, p *pgxpool.Pool, db, id, u int64) (int64, error) {
+		return submitRecovery(ctx, p, db, id, u, "retry")
+	})
+}
 func (h *Handler) Compensate(w http.ResponseWriter, r *http.Request) {
-	h.submitWith(w, r, "eid", Compensate)
+	h.submitWith(w, r, "eid", func(ctx context.Context, p *pgxpool.Pool, db, id, u int64) (int64, error) {
+		return submitRecovery(ctx, p, db, id, u, "compensate")
+	})
 }
 
 func (h *Handler) submitWith(w http.ResponseWriter, r *http.Request, key string, fn func(context.Context, *pgxpool.Pool, int64, int64, int64) (int64, error)) {
@@ -114,11 +92,7 @@ func (h *Handler) submitWith(w http.ResponseWriter, r *http.Request, key string,
 		return
 	}
 	eid, err := fn(r.Context(), h.DB, dbID(r), targetID, session.Current(r).UserID)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	httpx.JSON(w, http.StatusCreated, map[string]int64{"execution_id": eid})
+	respond(w, http.StatusCreated, map[string]int64{"execution_id": eid}, err)
 }
 
 func (h *Handler) Approve(w http.ResponseWriter, r *http.Request) {
@@ -132,11 +106,7 @@ func (h *Handler) Approve(w http.ResponseWriter, r *http.Request) {
 	if !httpx.Decode(w, r, &p) {
 		return
 	}
-	if err := Approve(r.Context(), h.DB, dbID(r), eid, session.Current(r).UserID, p.Decision); err != nil {
-		writeErr(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	respond(w, http.StatusNoContent, nil, Approve(r.Context(), h.DB, dbID(r), eid, session.Current(r).UserID, p.Decision))
 }
 
 func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
@@ -144,11 +114,7 @@ func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := Cancel(r.Context(), h.DB, dbID(r), eid); err != nil {
-		writeErr(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	respond(w, http.StatusNoContent, nil, Cancel(r.Context(), h.DB, dbID(r), eid))
 }
 
 func (h *Handler) Enqueue(w http.ResponseWriter, r *http.Request) {
@@ -157,15 +123,11 @@ func (h *Handler) Enqueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobID, err := Enqueue(r.Context(), h.DB, dbID(r), eid)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	httpx.JSON(w, http.StatusAccepted, struct {
+	respond(w, http.StatusAccepted, struct {
 		JobID       int64  `json:"job_id"`
 		ExecutionID int64  `json:"execution_id"`
 		Status      string `json:"status"`
-	}{jobID, eid, "pending"})
+	}{jobID, eid, "pending"}, err)
 }
 
 func dbID(r *http.Request) int64 {
@@ -173,11 +135,19 @@ func dbID(r *http.Request) int64 {
 	return id
 }
 
-func writeErr(w http.ResponseWriter, err error) {
-	var e *Error
-	if errors.As(err, &e) {
-		httpx.Error(w, e.Status, e.Msg)
+func respond(w http.ResponseWriter, status int, v any, err error) {
+	if err != nil {
+		var e *Error
+		if errors.As(err, &e) {
+			httpx.Error(w, e.Status, e.Msg)
+			return
+		}
+		httpx.Error(w, http.StatusInternalServerError, "terjadi kesalahan di server, coba lagi")
 		return
 	}
-	httpx.Error(w, http.StatusInternalServerError, "terjadi kesalahan di server, coba lagi")
+	if status == http.StatusNoContent {
+		w.WriteHeader(status)
+		return
+	}
+	httpx.JSON(w, status, v)
 }

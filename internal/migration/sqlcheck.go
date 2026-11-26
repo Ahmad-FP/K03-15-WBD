@@ -57,12 +57,12 @@ func cleanInput(in Input) (Input, error) {
 	if err := validateSQL(in.SQLUp, batch); err != nil {
 		return Input{}, err
 	}
-	if in.IrreversibleReason == "" {
-		if err := validateSQL(in.SQLDown, batch); errors.Is(err, ErrEmptySQL) {
-			return Input{}, ErrDownRequired
-		} else if err != nil {
-			return Input{}, err
-		}
+	if in.IrreversibleReason != "" {
+		in.SQLDown = ""
+	} else if err := validateSQL(in.SQLDown, batch); errors.Is(err, ErrEmptySQL) {
+		return Input{}, ErrDownRequired
+	} else if err != nil {
+		return Input{}, err
 	}
 	return in, nil
 }

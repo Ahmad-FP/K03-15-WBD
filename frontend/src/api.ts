@@ -6,6 +6,12 @@ export class ApiError extends Error {
   }
 }
 
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setUnauthorizedHandler(fn: (() => void) | null) {
+  unauthorizedHandler = fn;
+}
+
 export async function apiRequest<T>(
   path: string,
   init: RequestInit = {}
@@ -36,8 +42,14 @@ export async function apiRequest<T>(
   }
 
   if (!res.ok) {
+    if (res.status === 401 && path !== "/api/auth/login") {
+      unauthorizedHandler?.();
+    }
     const message =
-      parsed && typeof parsed === "object" && "error" in parsed && typeof (parsed as { error?: unknown }).error === "string"
+      parsed &&
+      typeof parsed === "object" &&
+      "error" in parsed &&
+      typeof (parsed as { error?: unknown }).error === "string"
         ? (parsed as { error: string }).error
         : rawText.trim() || `HTTP ${res.status}`;
     throw new ApiError(res.status, message);

@@ -13,7 +13,7 @@ import (
 	"github.com/Ahmad-FP/K03-15-WBD/internal/telemetry"
 )
 
-// SQL batch untuk benchmark, sama dengan contoh di docs/api-contract.md
+// SQL batch untuk benchmark
 const benchBatchSQL = `WITH batch AS (
     SELECT id FROM items
     WHERE ($1::bigint IS NULL OR id > $1::bigint)

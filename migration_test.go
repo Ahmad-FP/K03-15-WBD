@@ -1,18 +1,28 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Ahmad-FP/K03-15-WBD/internal/telemetry"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/worker"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 type wfEnv struct {
 	h            http.Handler
 	pool         *pgxpool.Pool
+	target       *pgxpool.Pool
 	dbID         int64
 	admin        string
 	editor       string
@@ -24,11 +34,14 @@ type wfEnv struct {
 	viewGroupID  int64
 }
 
-func setupWorkflow(t *testing.T) wfEnv {
+func setupWorkflow(t *testing.T, wrapTelemetry bool) wfEnv {
 	t.Helper()
 	h, pool := testServer(t)
+	if wrapTelemetry {
+		h = telemetry.Middleware(h)
+	}
 	admin := login(t, h, "admin", "admin")
-	_, dsn := targetSchema(t)
+	target, dsn := targetSchema(t)
 	dbID := addTarget(t, h, admin, dsn)
 
 	editorID := addUser(t, pool, "editor", "rahasia")
@@ -37,19 +50,16 @@ func setupWorkflow(t *testing.T) wfEnv {
 	viewLeadID := addUser(t, pool, "lead_view", "rahasia")
 	addUser(t, pool, "orang", "rahasia")
 
-	editGID := jsonID(t, doJSON(h, "POST", "/api/groups", admin, `{"name":"tim_edit","leader_id":`+itoa(editLeadID)+`}`))
-	doJSON(h, "POST", "/api/groups/"+itoa(editGID)+"/members", admin, `{"user_id":`+itoa(editorID)+`}`)
-	doJSON(h, "PUT", "/api/db/"+itoa(dbID)+"/access/"+itoa(editGID), admin, `{"access_level":"view_edit"}`)
+	editGID := jsonID(t, mustStatus(t, doJSON(h, "POST", "/api/groups", admin, `{"name":"tim_edit","leader_id":`+itoa(editLeadID)+`}`), http.StatusCreated))
+	mustStatus(t, doJSON(h, "POST", "/api/groups/"+itoa(editGID)+"/members", admin, `{"user_id":`+itoa(editorID)+`}`), http.StatusCreated)
+	mustStatus(t, doJSON(h, "PUT", "/api/db/"+itoa(dbID)+"/access/"+itoa(editGID), admin, `{"access_level":"view_edit"}`), http.StatusNoContent)
 
-	viewGID := jsonID(t, doJSON(h, "POST", "/api/groups", admin, `{"name":"tim_view","leader_id":`+itoa(viewLeadID)+`}`))
-	doJSON(h, "POST", "/api/groups/"+itoa(viewGID)+"/members", admin, `{"user_id":`+itoa(viewerID)+`}`)
-	doJSON(h, "PUT", "/api/db/"+itoa(dbID)+"/access/"+itoa(viewGID), admin, `{"access_level":"view_only"}`)
+	viewGID := jsonID(t, mustStatus(t, doJSON(h, "POST", "/api/groups", admin, `{"name":"tim_view","leader_id":`+itoa(viewLeadID)+`}`), http.StatusCreated))
+	mustStatus(t, doJSON(h, "POST", "/api/groups/"+itoa(viewGID)+"/members", admin, `{"user_id":`+itoa(viewerID)+`}`), http.StatusCreated)
+	mustStatus(t, doJSON(h, "PUT", "/api/db/"+itoa(dbID)+"/access/"+itoa(viewGID), admin, `{"access_level":"view_only"}`), http.StatusNoContent)
 
 	return wfEnv{
-		h:            h,
-		pool:         pool,
-		dbID:         dbID,
-		admin:        admin,
+		h: h, pool: pool, target: target, dbID: dbID, admin: admin,
 		editor:       login(t, h, "editor", "rahasia"),
 		editorLeader: login(t, h, "lead_edit", "rahasia"),
 		viewer:       login(t, h, "viewer", "rahasia"),
@@ -62,376 +72,355 @@ func setupWorkflow(t *testing.T) wfEnv {
 
 func createMig(t *testing.T, e wfEnv, body string) int64 {
 	t.Helper()
-	rec := doJSON(e.h, "POST", dbPath(e.dbID)+"/migrations", e.editor, body)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create migration: status %d %s", rec.Code, rec.Body)
-	}
-	return jsonID(t, rec)
+	return jsonID(t, mustStatus(t, doJSON(e.h, "POST", dbPath(e.dbID)+"/migrations", e.editor, body), http.StatusCreated))
 }
 
-func execIDFrom(t *testing.T, rec *http.Response, body []byte) int64 {
+func execID(t *testing.T, rec *httptest.ResponseRecorder) int64 {
 	t.Helper()
-	var out struct {
+	v := decode[struct {
 		ExecutionID int64 `json:"execution_id"`
+	}](t, mustStatus(t, rec, http.StatusCreated))
+	if v.ExecutionID == 0 {
+		t.Fatalf("missing execution_id: %s", rec.Body)
 	}
-	if err := json.Unmarshal(body, &out); err != nil || out.ExecutionID == 0 {
-		t.Fatalf("missing execution_id in %s", string(body))
-	}
-	return out.ExecutionID
+	return v.ExecutionID
 }
 
-func TestMigrationCRUDAndImmutability(t *testing.T) {
-	e := setupWorkflow(t)
-	base := dbPath(e.dbID) + "/migrations"
+func approveAll(t *testing.T, e wfEnv, eid int64) {
+	t.Helper()
+	p := dbPath(e.dbID) + "/executions/" + itoa(eid) + "/approve"
+	mustStatus(t, doJSON(e.h, "POST", p, e.viewerLeader, `{"decision":"approved"}`), http.StatusNoContent)
+	mustStatus(t, doJSON(e.h, "POST", p, e.editorLeader, `{"decision":"approved"}`), http.StatusNoContent)
+}
 
-	// validasi M2: reversible tanpa sql_down, batch tanpa kolom, batch multi-statement, COMMIT
+func runOneJob(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ran := false
+	w := &worker.Worker{
+		Pool: pool, Concurrency: 1, Poll: 20 * time.Millisecond,
+		Handle: func(ctx context.Context, job *worker.Job) {
+			(&worker.Executor{Pool: pool}).Handle(ctx, job)
+			ran = true
+			cancel()
+		},
+	}
+	w.Run(ctx)
+	if !ran {
+		t.Fatal("worker tidak menemukan job")
+	}
+}
+
+func TestMigrationCRUDAndWorkflow(t *testing.T) {
+	e := setupWorkflow(t, false)
+	base := dbPath(e.dbID)
+	mBase := base + "/migrations"
+
 	for _, bad := range []string{
 		`{"name":"a","sql_up":"CREATE TABLE t (id int);"}`,
 		`{"name":"a","sql_up":"SELECT 1","sql_down":"SELECT 1","batch_size":10}`,
 		`{"name":"a","sql_up":"SELECT 1; SELECT 2;","sql_down":"SELECT 1","batch_column":"id","batch_size":10}`,
 		`{"name":"a","sql_up":"CREATE TABLE t (id int);","sql_down":"DROP TABLE t; COMMIT;"}`,
 	} {
-		assertJSONError(t, doJSON(e.h, "POST", base, e.editor, bad), http.StatusBadRequest)
+		assertJSONError(t, doJSON(e.h, "POST", mBase, e.editor, bad), http.StatusBadRequest)
 	}
 
 	m1 := createMig(t, e, `{"name":"tambah produk","sql_up":"CREATE TABLE produk (id serial);","sql_down":"DROP TABLE produk;"}`)
-	// M2: boleh buat v2 walaupun v1 masih draft (ErrPending dihapus)
-	m2 := createMig(t, e, `{"name":"hapus lama","sql_up":"DELETE FROM produk;","irreversible_reason":"hapus permanen"}`)
+	irrev := decode[struct {
+		ID      int64  `json:"id"`
+		SQLDown string `json:"sql_down"`
+	}](t, mustStatus(t, doJSON(e.h, "POST", mBase, e.editor, `{"name":"hapus lama","sql_up":"DELETE FROM produk;","sql_down":"SELECT 1","irreversible_reason":"hapus permanen"}`), http.StatusCreated))
+	if irrev.SQLDown != "" {
+		t.Fatalf("irreversible seharusnya mengosongkan sql_down, dapat %q", irrev.SQLDown)
+	}
+	m2 := irrev.ID
 
-	// update & delete draft v2
-	rec := doJSON(e.h, "PUT", base+"/"+itoa(m2), e.editor, `{"name":"hapus lama v2","sql_up":"DELETE FROM produk;","irreversible_reason":"hapus permanen"}`)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"name":"hapus lama v2"`) {
-		t.Fatalf("update draft: %d %s", rec.Code, rec.Body)
+	if upd := mustStatus(t, doJSON(e.h, "PUT", mBase+"/"+itoa(m2), e.editor, `{"name":"hapus v2","sql_up":"DELETE FROM produk;","irreversible_reason":"hapus permanen"}`), http.StatusOK); !strings.Contains(upd.Body.String(), `"name":"hapus v2"`) {
+		t.Fatalf("update draft: %s", upd.Body)
 	}
-	if rec := doJSON(e.h, "DELETE", base+"/"+itoa(m2), e.editor, ""); rec.Code != http.StatusNoContent {
-		t.Fatalf("delete draft: %d", rec.Code)
-	}
-	assertJSONError(t, doJSON(e.h, "GET", base+"/"+itoa(m2), e.editor, ""), http.StatusNotFound)
+	mustStatus(t, doJSON(e.h, "DELETE", mBase+"/"+itoa(m2), e.editor, ""), http.StatusNoContent)
+	assertJSONError(t, doJSON(e.h, "GET", mBase+"/"+itoa(m2), e.editor, ""), http.StatusNotFound)
 
-	// view_only boleh baca, dilarang ubah/hapus/submit; orang tanpa akses ditolak
-	if rec := doJSON(e.h, "GET", base, e.viewer, ""); rec.Code != http.StatusOK {
-		t.Errorf("viewer list: %d", rec.Code)
-	}
+	mustStatus(t, doJSON(e.h, "GET", mBase, e.viewer, ""), http.StatusOK)
 	for _, req := range [][2]string{
-		{"POST", base}, {"PUT", base + "/" + itoa(m1)}, {"DELETE", base + "/" + itoa(m1)},
-		{"POST", base + "/" + itoa(m1) + "/submit"}, {"POST", base + "/" + itoa(m1) + "/rollback"},
+		{"POST", mBase}, {"PUT", mBase + "/" + itoa(m1)}, {"DELETE", mBase + "/" + itoa(m1)},
+		{"POST", mBase + "/" + itoa(m1) + "/submit"}, {"POST", mBase + "/" + itoa(m1) + "/rollback"},
 	} {
 		assertJSONError(t, doJSON(e.h, req[0], req[1], e.viewer, `{"name":"x","sql_up":"SELECT 1","sql_down":"SELECT 1"}`), http.StatusForbidden)
 	}
-	assertJSONError(t, doJSON(e.h, "GET", base, e.other, ""), http.StatusForbidden)
+	assertJSONError(t, doJSON(e.h, "GET", mBase, e.other, ""), http.StatusForbidden)
 
-	// setelah diajukan (punya baris di migration_executions), m1 menjadi immutable
-	sub := doJSON(e.h, "POST", base+"/"+itoa(m1)+"/submit", e.editor, "")
-	if sub.Code != http.StatusCreated {
-		t.Fatalf("submit: %d %s", sub.Code, sub.Body)
+	e.pool.Exec(t.Context(), `UPDATE platform_groups SET leader_id = NULL WHERE id = $1`, e.viewGroupID)
+	assertJSONError(t, doJSON(e.h, "POST", mBase+"/"+itoa(m1)+"/submit", e.editor, ""), http.StatusConflict)
+	e.pool.Exec(t.Context(), `UPDATE platform_groups SET leader_id = (SELECT id FROM users WHERE username = 'lead_view') WHERE id = $1`, e.viewGroupID)
+
+	eid := execID(t, doJSON(e.h, "POST", mBase+"/"+itoa(m1)+"/submit", e.editor, ""))
+	if !strings.Contains(mustStatus(t, doJSON(e.h, "GET", mBase+"/"+itoa(m1), e.viewer, ""), http.StatusOK).Body.String(), `"immutable":true`) {
+		t.Error("m1 harus immutable")
 	}
-	det := doJSON(e.h, "GET", base+"/"+itoa(m1), e.viewer, "")
-	if det.Code != http.StatusOK || !strings.Contains(det.Body.String(), `"immutable":true`) {
-		t.Errorf("m1 harus immutable: %s", det.Body)
-	}
-	assertJSONError(t, doJSON(e.h, "PUT", base+"/"+itoa(m1), e.editor, `{"name":"ubah","sql_up":"SELECT 1","sql_down":"SELECT 1"}`), http.StatusConflict)
-	assertJSONError(t, doJSON(e.h, "DELETE", base+"/"+itoa(m1), e.editor, ""), http.StatusConflict)
-}
+	assertJSONError(t, doJSON(e.h, "PUT", mBase+"/"+itoa(m1), e.editor, `{"name":"ubah","sql_up":"SELECT 1","sql_down":"SELECT 1"}`), http.StatusConflict)
+	assertJSONError(t, doJSON(e.h, "DELETE", mBase+"/"+itoa(m1), e.editor, ""), http.StatusConflict)
 
-func TestWorkflowApprovalAndEnqueue(t *testing.T) {
-	e := setupWorkflow(t)
-	base := dbPath(e.dbID)
+	ePath := base + "/executions/" + itoa(eid)
+	assertJSONError(t, doJSON(e.h, "POST", mBase+"/"+itoa(m1)+"/submit", e.editor, ""), http.StatusConflict)
+	assertJSONError(t, doJSON(e.h, "POST", ePath+"/enqueue", e.editor, ""), http.StatusConflict)
+	assertJSONError(t, doJSON(e.h, "POST", ePath+"/approve", e.editor, `{"decision":"approved"}`), http.StatusForbidden)
+	assertJSONError(t, doJSON(e.h, "POST", ePath+"/approve", e.viewer, `{"decision":"approved"}`), http.StatusForbidden)
+	assertJSONError(t, doJSON(e.h, "POST", ePath+"/approve", e.viewerLeader, `{"decision":"maybe"}`), http.StatusBadRequest)
 
-	m1 := createMig(t, e, `{"name":"init","sql_up":"CREATE TABLE a (id int);","sql_down":"DROP TABLE a;"}`)
-
-	// jika salah satu group (termasuk view_only) tidak punya leader → submit ditolak 409
-	e.pool.Exec(context.Background(), `UPDATE platform_groups SET leader_id = NULL WHERE id = $1`, e.viewGroupID)
-	assertJSONError(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m1)+"/submit", e.editor, ""), http.StatusConflict)
-
-	// kembalikan leader group view_only
-	var viewLeadID int64
-	e.pool.QueryRow(context.Background(), `SELECT id FROM users WHERE username = 'lead_view'`).Scan(&viewLeadID)
-	e.pool.Exec(context.Background(), `UPDATE platform_groups SET leader_id = $2 WHERE id = $1`, e.viewGroupID, viewLeadID)
-
-	// submit sukses
-	rec := doJSON(e.h, "POST", base+"/migrations/"+itoa(m1)+"/submit", e.editor, "")
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("submit: %d %s", rec.Code, rec.Body)
-	}
-	eid := execIDFrom(t, rec.Result(), rec.Body.Bytes())
-	execPath := base + "/executions/" + itoa(eid)
-
-	// submit dobel in-flight ditolak 409
-	assertJSONError(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m1)+"/submit", e.editor, ""), http.StatusConflict)
-	// enqueue sebelum approved ditolak 409
-	assertJSONError(t, doJSON(e.h, "POST", execPath+"/enqueue", e.editor, ""), http.StatusConflict)
-	// non-leader ditolak 403, decision salah ditolak 400
-	assertJSONError(t, doJSON(e.h, "POST", execPath+"/approve", e.editor, `{"decision":"approved"}`), http.StatusForbidden)
-	assertJSONError(t, doJSON(e.h, "POST", execPath+"/approve", e.viewer, `{"decision":"approved"}`), http.StatusForbidden)
-	assertJSONError(t, doJSON(e.h, "POST", execPath+"/approve", e.viewerLeader, `{"decision":"maybe"}`), http.StatusBadRequest)
-
-	// cross-DB execution ID ditolak 404
 	_, dsn2 := targetSchema(t)
 	db2 := addTarget(t, e.h, e.admin, dsn2)
-	doJSON(e.h, "PUT", "/api/db/"+itoa(db2)+"/access/"+itoa(e.editGroupID), e.admin, `{"access_level":"view_edit"}`)
+	mustStatus(t, doJSON(e.h, "PUT", "/api/db/"+itoa(db2)+"/access/"+itoa(e.editGroupID), e.admin, `{"access_level":"view_edit"}`), http.StatusNoContent)
 	assertJSONError(t, doJSON(e.h, "GET", dbPath(db2)+"/executions/"+itoa(eid), e.editorLeader, ""), http.StatusNotFound)
 	assertJSONError(t, doJSON(e.h, "POST", dbPath(db2)+"/executions/"+itoa(eid)+"/approve", e.editorLeader, `{"decision":"approved"}`), http.StatusNotFound)
 	assertJSONError(t, doJSON(e.h, "POST", dbPath(db2)+"/executions/"+itoa(eid)+"/cancel", e.editorLeader, ""), http.StatusNotFound)
 
-	// leader view_only approve pertama → masih pending_review, approve ulang 409
-	if rec := doJSON(e.h, "POST", execPath+"/approve", e.viewerLeader, `{"decision":"approved"}`); rec.Code != http.StatusNoContent {
-		t.Fatalf("viewerLeader approve: %d %s", rec.Code, rec.Body)
+	mustStatus(t, doJSON(e.h, "POST", ePath+"/approve", e.viewerLeader, `{"decision":"approved"}`), http.StatusNoContent)
+	assertJSONError(t, doJSON(e.h, "POST", ePath+"/approve", e.viewerLeader, `{"decision":"approved"}`), http.StatusConflict)
+	if !strings.Contains(doJSON(e.h, "GET", ePath, e.viewer, "").Body.String(), `"status":"pending_review"`) {
+		t.Error("harus masih pending_review")
 	}
-	assertJSONError(t, doJSON(e.h, "POST", execPath+"/approve", e.viewerLeader, `{"decision":"approved"}`), http.StatusConflict)
-	if det := doJSON(e.h, "GET", execPath, e.viewer, ""); !strings.Contains(det.Body.String(), `"status":"pending_review"`) {
-		t.Errorf("harus masih pending_review: %s", det.Body)
+	mustStatus(t, doJSON(e.h, "POST", ePath+"/approve", e.editorLeader, `{"decision":"approved"}`), http.StatusNoContent)
+	assertJSONError(t, doJSON(e.h, "POST", ePath+"/approve", e.editorLeader, `{"decision":"rejected"}`), http.StatusConflict)
+	assertJSONError(t, doJSON(e.h, "POST", ePath+"/enqueue", e.viewerLeader, ""), http.StatusForbidden)
+
+	enq := mustStatus(t, doJSON(e.h, "POST", ePath+"/enqueue", e.editor, ""), http.StatusAccepted)
+	if !strings.Contains(enq.Body.String(), `"status":"pending"`) || !strings.Contains(enq.Body.String(), `"job_id":`) {
+		t.Fatalf("enqueue body salah: %s", enq.Body)
 	}
+	assertJSONError(t, doJSON(e.h, "POST", ePath+"/enqueue", e.editor, ""), http.StatusConflict)
+	assertJSONError(t, doJSON(e.h, "POST", ePath+"/cancel", e.editor, ""), http.StatusConflict)
 
-	// leader view_edit approve kedua → jadi approved!
-	if rec := doJSON(e.h, "POST", execPath+"/approve", e.editorLeader, `{"decision":"approved"}`); rec.Code != http.StatusNoContent {
-		t.Fatalf("editorLeader approve: %d %s", rec.Code, rec.Body)
-	}
-	assertJSONError(t, doJSON(e.h, "POST", execPath+"/approve", e.editorLeader, `{"decision":"rejected"}`), http.StatusConflict)
-
-	// view_only tidak boleh enqueue
-	assertJSONError(t, doJSON(e.h, "POST", execPath+"/enqueue", e.viewerLeader, ""), http.StatusForbidden)
-
-	// enqueue sukses → 202 + migration_jobs terbuat
-	enq := doJSON(e.h, "POST", execPath+"/enqueue", e.editor, "")
-	if enq.Code != http.StatusAccepted || !strings.Contains(enq.Body.String(), `"status":"pending"`) || !strings.Contains(enq.Body.String(), `"job_id":`) {
-		t.Fatalf("enqueue: %d %s", enq.Code, enq.Body)
-	}
-	// enqueue ulang atau cancel setelah pending → 409
-	assertJSONError(t, doJSON(e.h, "POST", execPath+"/enqueue", e.editor, ""), http.StatusConflict)
-	assertJSONError(t, doJSON(e.h, "POST", execPath+"/cancel", e.editor, ""), http.StatusConflict)
-
-	// detail execution memuat latest_execution_id, job_id, job_status, sql_snapshot, approvals
-	var detail struct {
+	det := decode[struct {
 		Status            string  `json:"status"`
 		SQLSnapshot       string  `json:"sql_snapshot"`
 		LatestExecutionID int64   `json:"latest_execution_id"`
 		JobID             *int64  `json:"job_id"`
 		JobStatus         *string `json:"job_status"`
-		Approvals         []struct {
-			GroupName         string  `json:"group_name"`
-			Status            string  `json:"status"`
-			DecidedByUsername *string `json:"decided_by_username"`
-		} `json:"approvals"`
+		Approvals         []any   `json:"approvals"`
+	}](t, mustStatus(t, doJSON(e.h, "GET", ePath, e.viewer, ""), http.StatusOK))
+	if det.Status != "pending" || det.LatestExecutionID != eid || det.JobID == nil || det.JobStatus == nil || *det.JobStatus != "pending" || len(det.Approvals) != 2 || det.SQLSnapshot == "" {
+		t.Errorf("detail tidak lengkap: %+v", det)
 	}
-	detRec := doJSON(e.h, "GET", execPath, e.viewer, "")
-	if detRec.Code != http.StatusOK || json.Unmarshal(detRec.Body.Bytes(), &detail) != nil {
-		t.Fatalf("detail: %d %s", detRec.Code, detRec.Body)
-	}
-	if detail.Status != "pending" || detail.LatestExecutionID != eid || detail.JobID == nil || detail.JobStatus == nil || *detail.JobStatus != "pending" || len(detail.Approvals) != 2 || detail.SQLSnapshot == "" {
-		t.Errorf("detail tidak lengkap: %+v", detail)
-	}
+
+	e.pool.Exec(t.Context(), `UPDATE migration_executions SET status = 'failed' WHERE id = $1`, eid)
+	rejID := execID(t, doJSON(e.h, "POST", mBase+"/"+itoa(m1)+"/submit", e.editor, ""))
+	mustStatus(t, doJSON(e.h, "POST", base+"/executions/"+itoa(rejID)+"/approve", e.viewerLeader, `{"decision":"rejected"}`), http.StatusNoContent)
+	assertJSONError(t, doJSON(e.h, "POST", base+"/executions/"+itoa(rejID)+"/approve", e.editorLeader, `{"decision":"approved"}`), http.StatusConflict)
+
+	canID := execID(t, doJSON(e.h, "POST", mBase+"/"+itoa(m1)+"/submit", e.editor, ""))
+	approveAll(t, e, canID)
+	mustStatus(t, doJSON(e.h, "POST", base+"/executions/"+itoa(canID)+"/cancel", e.editor, ""), http.StatusNoContent)
+	assertJSONError(t, doJSON(e.h, "POST", base+"/executions/"+itoa(canID)+"/enqueue", e.editor, ""), http.StatusConflict)
 }
 
-func TestWorkflowRejectAndCancel(t *testing.T) {
-	e := setupWorkflow(t)
-	base := dbPath(e.dbID)
-	m1 := createMig(t, e, `{"name":"init","sql_up":"SELECT 1","sql_down":"SELECT 1"}`)
-
-	// satu leader reject → execution langsung rejected, leader lain dapat 409
-	sub := doJSON(e.h, "POST", base+"/migrations/"+itoa(m1)+"/submit", e.editor, "")
-	eid := execIDFrom(t, sub.Result(), sub.Body.Bytes())
-	if rec := doJSON(e.h, "POST", base+"/executions/"+itoa(eid)+"/approve", e.viewerLeader, `{"decision":"rejected"}`); rec.Code != http.StatusNoContent {
-		t.Fatalf("reject: %d %s", rec.Code, rec.Body)
-	}
-	assertJSONError(t, doJSON(e.h, "POST", base+"/executions/"+itoa(eid)+"/approve", e.editorLeader, `{"decision":"approved"}`), http.StatusConflict)
-
-	// submit lagi lalu cancel saat approved → 204
-	sub2 := doJSON(e.h, "POST", base+"/migrations/"+itoa(m1)+"/submit", e.editor, "")
-	eid2 := execIDFrom(t, sub2.Result(), sub2.Body.Bytes())
-	doJSON(e.h, "POST", base+"/executions/"+itoa(eid2)+"/approve", e.viewerLeader, `{"decision":"approved"}`)
-	doJSON(e.h, "POST", base+"/executions/"+itoa(eid2)+"/approve", e.editorLeader, `{"decision":"approved"}`)
-	if rec := doJSON(e.h, "POST", base+"/executions/"+itoa(eid2)+"/cancel", e.editor, ""); rec.Code != http.StatusNoContent {
-		t.Fatalf("cancel approved: %d %s", rec.Code, rec.Body)
-	}
-	assertJSONError(t, doJSON(e.h, "POST", base+"/executions/"+itoa(eid2)+"/enqueue", e.editor, ""), http.StatusConflict)
-}
-
-func TestRollbackForwardAndHideRollback(t *testing.T) {
-	e := setupWorkflow(t)
+func TestRollbackForwardAndRecovery(t *testing.T) {
+	e := setupWorkflow(t, false)
 	ctx := context.Background()
 	base := dbPath(e.dbID)
 
 	m1 := createMig(t, e, `{"name":"v1","sql_up":"SELECT 1","sql_down":"SELECT -1"}`)
 	m2 := createMig(t, e, `{"name":"v2","sql_up":"SELECT 2","sql_down":"SELECT -2"}`)
 	m3 := createMig(t, e, `{"name":"v3","sql_up":"SELECT 3","sql_down":"SELECT -3"}`)
-
-	// tidak boleh submit v2 jika v1 masih draft tanpa execution
 	assertJSONError(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m2)+"/submit", e.editor, ""), http.StatusConflict)
 
-	// simulasikan v1 [E1], v2 [E2], v3 [E3] berhasil
 	var e1, e2, e3 int64
 	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status) VALUES ($1,$2,1,'up','SELECT 1','success') RETURNING id`, m1, e.dbID).Scan(&e1)
 	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status) VALUES ($1,$2,2,'up','SELECT 2','success') RETURNING id`, m2, e.dbID).Scan(&e2)
 	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status) VALUES ($1,$2,3,'up','SELECT 3','success') RETURNING id`, m3, e.dbID).Scan(&e3)
 
-	// hanya v3 (active_head) yang bisa di-rollback
-	if det := doJSON(e.h, "GET", base+"/migrations/"+itoa(m2), e.viewer, ""); !strings.Contains(det.Body.String(), `"can_rollback":false`) {
-		t.Errorf("v2 seharusnya tidak bisa rollback: %s", det.Body)
-	}
-	if det := doJSON(e.h, "GET", base+"/migrations/"+itoa(m3), e.viewer, ""); !strings.Contains(det.Body.String(), `"can_rollback":true`) {
-		t.Errorf("v3 seharusnya bisa rollback: %s", det.Body)
+	if !strings.Contains(doJSON(e.h, "GET", base+"/migrations/"+itoa(m2), e.viewer, "").Body.String(), `"can_rollback":false`) ||
+		!strings.Contains(doJSON(e.h, "GET", base+"/migrations/"+itoa(m3), e.viewer, "").Body.String(), `"can_rollback":true`) {
+		t.Error("can_rollback salah")
 	}
 	assertJSONError(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m2)+"/rollback", e.editor, ""), http.StatusConflict)
 
-	// ajukan rollback v3 lalu simulasikan sukses
-	rb3Rec := doJSON(e.h, "POST", base+"/migrations/"+itoa(m3)+"/rollback", e.editor, "")
-	if rb3Rec.Code != http.StatusCreated {
-		t.Fatalf("rollback v3: %d %s", rb3Rec.Code, rb3Rec.Body)
-	}
-	rb3 := execIDFrom(t, rb3Rec.Result(), rb3Rec.Body.Bytes())
+	rb3 := execID(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m3)+"/rollback", e.editor, ""))
 	e.pool.Exec(ctx, `UPDATE migration_executions SET status = 'success' WHERE id = $1`, rb3)
-
-	// simulasikan juga rollback v2 sukses → sekarang active_head = v1, v2 & v3 sama-sama rolled-back
-	rb2Rec := doJSON(e.h, "POST", base+"/migrations/"+itoa(m2)+"/rollback", e.editor, "")
-	if rb2Rec.Code != http.StatusCreated {
-		t.Fatalf("rollback v2: %d %s", rb2Rec.Code, rb2Rec.Body)
-	}
-	rb2 := execIDFrom(t, rb2Rec.Result(), rb2Rec.Body.Bytes())
+	rb2 := execID(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m2)+"/rollback", e.editor, ""))
 	e.pool.Exec(ctx, `UPDATE migration_executions SET status = 'success' WHERE id = $1`, rb2)
 
-	// forward v3 sebelum v2 ditolak 409
 	assertJSONError(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m3)+"/submit", e.editor, ""), http.StatusConflict)
-	if det := doJSON(e.h, "GET", base+"/migrations/"+itoa(m3), e.viewer, ""); !strings.Contains(det.Body.String(), `"can_forward":false`) {
-		t.Errorf("v3 seharusnya can_forward=false: %s", det.Body)
+	if !strings.Contains(doJSON(e.h, "GET", base+"/migrations/"+itoa(m3), e.viewer, "").Body.String(), `"can_forward":false`) {
+		t.Error("v3 seharusnya can_forward=false")
 	}
 
-	// forward v2 → sukses diajukan; setelah v2 in-flight, forward v3 boleh diajukan, tapi enqueue v3 sebelum v2 di-enqueue ditolak 409
-	fw2Rec := doJSON(e.h, "POST", base+"/migrations/"+itoa(m2)+"/submit", e.editor, "")
-	if fw2Rec.Code != http.StatusCreated {
-		t.Fatalf("forward v2: %d %s", fw2Rec.Code, fw2Rec.Body)
-	}
-	fw2 := execIDFrom(t, fw2Rec.Result(), fw2Rec.Body.Bytes())
-	fw3Rec := doJSON(e.h, "POST", base+"/migrations/"+itoa(m3)+"/submit", e.editor, "")
-	if fw3Rec.Code != http.StatusCreated {
-		t.Fatalf("forward v3 dengan v2 in-flight: %d %s", fw3Rec.Code, fw3Rec.Body)
-	}
-	fw3 := execIDFrom(t, fw3Rec.Result(), fw3Rec.Body.Bytes())
-	for _, eid := range []int64{fw2, fw3} {
-		doJSON(e.h, "POST", base+"/executions/"+itoa(eid)+"/approve", e.viewerLeader, `{"decision":"approved"}`)
-		doJSON(e.h, "POST", base+"/executions/"+itoa(eid)+"/approve", e.editorLeader, `{"decision":"approved"}`)
-	}
+	fw2 := execID(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m2)+"/submit", e.editor, ""))
+	fw3 := execID(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m3)+"/submit", e.editor, ""))
+	approveAll(t, e, fw2)
+	approveAll(t, e, fw3)
 	assertJSONError(t, doJSON(e.h, "POST", base+"/executions/"+itoa(fw3)+"/enqueue", e.editor, ""), http.StatusConflict)
 
-	// tambah attempt gagal untuk memastikan kegagalan tetap terlihat saat hide_rollback=true
 	var failID int64
 	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status, error) VALUES ($1,$2,2,'rollback','SELECT -2','failed','boom') RETURNING id`, m2, e.dbID).Scan(&failID)
 
-	// hide_rollback=false menampilkan semua, hide_rollback=true menyembunyikan {e2,rb2} dan {e3,rb3} tapi tetap menampilkan e1, fw2, fw3, failID
-	allRec := doJSON(e.h, "GET", base+"/executions?hide_rollback=false", e.viewer, "")
-	hideRec := doJSON(e.h, "GET", base+"/executions?hide_rollback=true", e.viewer, "")
-	var allList, hideList []struct {
-		ID int64 `json:"id"`
-	}
-	json.Unmarshal(allRec.Body.Bytes(), &allList)
-	json.Unmarshal(hideRec.Body.Bytes(), &hideList)
+	allList := decode[[]struct{ ID int64 }](t, mustStatus(t, doJSON(e.h, "GET", base+"/executions?hide_rollback=false", e.viewer, ""), http.StatusOK))
+	hideList := decode[[]struct{ ID int64 }](t, mustStatus(t, doJSON(e.h, "GET", base+"/executions?hide_rollback=true", e.viewer, ""), http.StatusOK))
 	if len(allList) != len(hideList)+4 {
-		t.Fatalf("all=%d hide=%d (harus selisih 4: 2 pasang rollback)", len(allList), len(hideList))
+		t.Fatalf("all=%d hide=%d", len(allList), len(hideList))
 	}
 	hidden := map[int64]bool{e2: true, rb2: true, e3: true, rb3: true}
 	seenFail := false
-	for _, item := range hideList {
-		if hidden[item.ID] {
-			t.Errorf("id %d seharusnya disembunyikan oleh hide_rollback=true", item.ID)
+	for _, it := range hideList {
+		if hidden[it.ID] {
+			t.Errorf("id %d seharusnya disembunyikan", it.ID)
 		}
-		if item.ID == failID {
+		if it.ID == failID {
 			seenFail = true
 		}
 	}
 	if !seenFail {
-		t.Error("attempt gagal ikut tersembunyi di hide_rollback=true")
+		t.Error("attempt gagal ikut tersembunyi")
 	}
 
-	// cek auto-retry join latest_execution_id & job_status (worker menandai attempt 1 failed dulu sebelum insert attempt 2)
-	if _, err := e.pool.Exec(ctx, `UPDATE migration_executions SET status = 'failed' WHERE id = $1`, fw2); err != nil {
-		t.Fatal(err)
-	}
+	e.pool.Exec(ctx, `UPDATE migration_executions SET status = 'failed' WHERE id = $1`, fw2)
 	var attempt2 int64
-	if err := e.pool.QueryRow(ctx, `INSERT INTO migration_executions (request_id, migration_id, database_id, version, operation, attempt, sql_snapshot, status) VALUES ($1,$2,$3,2,'forward',2,'SELECT 2','running') RETURNING id`, fw2, m2, e.dbID).Scan(&attempt2); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.pool.Exec(ctx, `INSERT INTO migration_jobs (execution_id, status) VALUES ($1, 'running')`, attempt2); err != nil {
-		t.Fatal(err)
-	}
-	var det struct {
+	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (request_id, migration_id, database_id, version, operation, attempt, sql_snapshot, status) VALUES ($1,$2,$3,2,'forward',2,'SELECT 2','running') RETURNING id`, fw2, m2, e.dbID).Scan(&attempt2)
+	e.pool.Exec(ctx, `INSERT INTO migration_jobs (execution_id, status) VALUES ($1, 'running')`, attempt2)
+	det := decode[struct {
 		LatestExecutionID int64   `json:"latest_execution_id"`
 		JobStatus         *string `json:"job_status"`
-	}
-	json.Unmarshal(doJSON(e.h, "GET", base+"/executions/"+itoa(fw2), e.viewer, "").Body.Bytes(), &det)
+	}](t, mustStatus(t, doJSON(e.h, "GET", base+"/executions/"+itoa(fw2), e.viewer, ""), http.StatusOK))
 	if det.LatestExecutionID != attempt2 || det.JobStatus == nil || *det.JobStatus != "running" {
-		t.Errorf("latest_execution_id/job_status = %+v, want %d/running", det, attempt2)
+		t.Errorf("latest/job_status = %+v, want %d/running", det, attempt2)
 	}
-}
 
-func TestRetryAndCompensate(t *testing.T) {
-	e := setupWorkflow(t)
-	ctx := context.Background()
-	base := dbPath(e.dbID)
-
-	m1 := createMig(t, e, `{"name":"batch","sql_up":"UPDATE t SET x=1 WHERE id>$1 LIMIT $2","sql_down":"UPDATE t SET x=0 WHERE id>$1 AND id<=$2","batch_column":"id","batch_size":100}`)
+	e.pool.Exec(ctx, `UPDATE migration_executions SET status = 'failed' WHERE id IN ($1, $2)`, attempt2, fw3)
+	mBatch := createMig(t, e, `{"name":"batch","sql_up":"UPDATE t SET x=1 WHERE id>$1 LIMIT $2","sql_down":"UPDATE t SET x=0 WHERE id>$1 AND id<=$2","batch_column":"id","batch_size":100}`)
 	mIrr := createMig(t, e, `{"name":"irr","sql_up":"DELETE FROM t WHERE id>$1","irreversible_reason":"hapus","batch_column":"id","batch_size":100}`)
-
-	// simulasikan batch m1 partial
 	var p1 int64
-	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status, batches_committed) VALUES ($1,$2,1,'up','UPDATE t','partial',3) RETURNING id`, m1, e.dbID).Scan(&p1)
+	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status, batches_committed) VALUES ($1,$2,4,'up','UPDATE t','partial',3) RETURNING id`, mBatch, e.dbID).Scan(&p1)
 
-	// tidak boleh submit ulang saat masih unresolved partial
-	assertJSONError(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m1)+"/submit", e.editor, ""), http.StatusConflict)
-
-	// retry sukses + in-flight duplikat 409
-	r1Rec := doJSON(e.h, "POST", base+"/executions/"+itoa(p1)+"/retry", e.editor, "")
-	if r1Rec.Code != http.StatusCreated {
-		t.Fatalf("retry: %d %s", r1Rec.Code, r1Rec.Body)
+	assertJSONError(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(mBatch)+"/submit", e.editor, ""), http.StatusConflict)
+	assertJSONError(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m1)+"/rollback", e.editor, ""), http.StatusConflict)
+	assertJSONError(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(mIrr)+"/submit", e.editor, ""), http.StatusConflict)
+	if !strings.Contains(doJSON(e.h, "GET", base+"/migrations/"+itoa(m1), e.viewer, "").Body.String(), `"can_rollback":false`) {
+		t.Error("m1 tidak boleh can_rollback=true saat DB punya unresolved partial")
 	}
-	r1 := execIDFrom(t, r1Rec.Result(), r1Rec.Body.Bytes())
+
+	r1 := execID(t, doJSON(e.h, "POST", base+"/executions/"+itoa(p1)+"/retry", e.editor, ""))
 	assertJSONError(t, doJSON(e.h, "POST", base+"/executions/"+itoa(p1)+"/retry", e.editor, ""), http.StatusConflict)
+	mustStatus(t, doJSON(e.h, "POST", base+"/executions/"+itoa(r1)+"/cancel", e.editor, ""), http.StatusNoContent)
 
-	// cancel r1, lalu ajukan compensate atas p1
-	doJSON(e.h, "POST", base+"/executions/"+itoa(r1)+"/cancel", e.editor, "")
-	c1Rec := doJSON(e.h, "POST", base+"/executions/"+itoa(p1)+"/compensate", e.editor, "")
-	if c1Rec.Code != http.StatusCreated {
-		t.Fatalf("compensate: %d %s", c1Rec.Code, c1Rec.Body)
-	}
-	c1 := execIDFrom(t, c1Rec.Result(), c1Rec.Body.Bytes())
-
-	// simulasikan c1 menjadi partially_reverted (menggantikan p1 sebagai unresolved terbaru)
+	c1 := execID(t, doJSON(e.h, "POST", base+"/executions/"+itoa(p1)+"/compensate", e.editor, ""))
 	e.pool.Exec(ctx, `UPDATE migration_executions SET status = 'partially_reverted' WHERE id = $1`, c1)
-
-	// p1 sudah tidak unresolved → retry/compensate ke p1 ditolak 409; retry ke partially_reverted juga 409
 	assertJSONError(t, doJSON(e.h, "POST", base+"/executions/"+itoa(p1)+"/retry", e.editor, ""), http.StatusConflict)
 	assertJSONError(t, doJSON(e.h, "POST", base+"/executions/"+itoa(p1)+"/compensate", e.editor, ""), http.StatusConflict)
 	assertJSONError(t, doJSON(e.h, "POST", base+"/executions/"+itoa(c1)+"/retry", e.editor, ""), http.StatusConflict)
 
-	// compensate lanjutan atas c1 (partially_reverted) sukses dan mempertahankan parent_execution_id = p1
-	c2Rec := doJSON(e.h, "POST", base+"/executions/"+itoa(c1)+"/compensate", e.editor, "")
-	if c2Rec.Code != http.StatusCreated {
-		t.Fatalf("compensate lanjutan: %d %s", c2Rec.Code, c2Rec.Body)
-	}
-	c2 := execIDFrom(t, c2Rec.Result(), c2Rec.Body.Bytes())
+	c2 := execID(t, doJSON(e.h, "POST", base+"/executions/"+itoa(c1)+"/compensate", e.editor, ""))
 	var parentID, revID *int64
 	e.pool.QueryRow(ctx, `SELECT parent_execution_id, reverted_execution_id FROM migration_executions WHERE id = $1`, c2).Scan(&parentID, &revID)
 	if parentID == nil || *parentID != p1 || revID != nil {
-		t.Errorf("compensate c2 parent=%v rev=%v, want parent=%d rev=nil", parentID, revID, p1)
+		t.Errorf("compensate c2 parent=%v rev=%v, want %d/nil", parentID, revID, p1)
 	}
+	e.pool.Exec(ctx, `UPDATE migration_executions SET status = 'success' WHERE id = $1`, c2)
 
-	// compensate pada rollback partially_reverted harus mempertahankan reverted_execution_id = active.id
-	m3 := createMig(t, e, `{"name":"batch-rb","sql_up":"UPDATE t SET y=1 WHERE id>$1 LIMIT $2","sql_down":"UPDATE t SET y=0 WHERE id>$1 AND id<=$2","batch_column":"id","batch_size":100}`)
 	var actID, rbPartial int64
-	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status) VALUES ($1,$2,3,'up','UPDATE t','success') RETURNING id`, m3, e.dbID).Scan(&actID)
-	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status, reverted_execution_id, parent_execution_id) VALUES ($1,$2,3,'rollback','UPDATE t','partially_reverted',$3,$3) RETURNING id`, m3, e.dbID, actID).Scan(&rbPartial)
-	// rollback baru ditolak selama partially_reverted belum selesai
-	assertJSONError(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m3)+"/rollback", e.editor, ""), http.StatusConflict)
-	cRbRec := doJSON(e.h, "POST", base+"/executions/"+itoa(rbPartial)+"/compensate", e.editor, "")
-	if cRbRec.Code != http.StatusCreated {
-		t.Fatalf("compensate rollback partially_reverted: %d %s", cRbRec.Code, cRbRec.Body)
-	}
-	cRb := execIDFrom(t, cRbRec.Result(), cRbRec.Body.Bytes())
+	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status) VALUES ($1,$2,4,'up','UPDATE t','success') RETURNING id`, mBatch, e.dbID).Scan(&actID)
+	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status, reverted_execution_id, parent_execution_id) VALUES ($1,$2,4,'rollback','UPDATE t','partially_reverted',$3,$3) RETURNING id`, mBatch, e.dbID, actID).Scan(&rbPartial)
+	assertJSONError(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(mBatch)+"/rollback", e.editor, ""), http.StatusConflict)
+	cRb := execID(t, doJSON(e.h, "POST", base+"/executions/"+itoa(rbPartial)+"/compensate", e.editor, ""))
 	e.pool.QueryRow(ctx, `SELECT parent_execution_id, reverted_execution_id FROM migration_executions WHERE id = $1`, cRb).Scan(&parentID, &revID)
 	if parentID == nil || *parentID != actID || revID == nil || *revID != actID {
 		t.Errorf("compensate rollback parent=%v rev=%v, want %d/%d", parentID, revID, actID, actID)
 	}
 
-	// compensate pada migration irreversible ditolak 409
 	var pIrr int64
-	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status, batches_committed) VALUES ($1,$2,2,'up','DELETE FROM t','partial',1) RETURNING id`, mIrr, e.dbID).Scan(&pIrr)
+	e.pool.QueryRow(ctx, `INSERT INTO migration_executions (migration_id, database_id, version, operation, sql_snapshot, status, batches_committed) VALUES ($1,$2,5,'up','DELETE FROM t','partial',1) RETURNING id`, mIrr, e.dbID).Scan(&pIrr)
 	assertJSONError(t, doJSON(e.h, "POST", base+"/executions/"+itoa(pIrr)+"/compensate", e.editor, ""), http.StatusConflict)
+}
+
+func TestMigrationWorkerEndToEnd(t *testing.T) {
+	e := setupWorkflow(t, true)
+	base := dbPath(e.dbID)
+
+	spans := tracetest.NewSpanRecorder()
+	prevTP := otel.GetTracerProvider()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)))
+	defer otel.SetTracerProvider(prevTP)
+
+	var logBuf bytes.Buffer
+	prevLog := slog.Default()
+	slog.SetDefault(telemetry.NewLogger(&logBuf))
+	defer slog.SetDefault(prevLog)
+
+	m1 := createMig(t, e, `{
+		"name":"create_items",
+		"sql_up":"CREATE TABLE items (id bigint PRIMARY KEY, status text NOT NULL, divisor int NOT NULL); INSERT INTO items VALUES (1,'old',1),(2,'old',1),(3,'old',0),(4,'old',1);",
+		"sql_down":"DROP TABLE items;"
+	}`)
+	m2 := createMig(t, e, `{
+		"name":"backfill_items",
+		"sql_up":"WITH batch AS (SELECT id FROM items WHERE ($1::bigint IS NULL OR id > $1::bigint) ORDER BY id LIMIT $2) UPDATE items SET status = 'new_' || (100 / divisor) FROM batch WHERE items.id = batch.id RETURNING items.id::text",
+		"sql_down":"UPDATE items SET status = 'old' WHERE ($1::bigint IS NULL OR id > $1::bigint) AND id <= $2::bigint",
+		"batch_column":"id","batch_size":2
+	}`)
+
+	run := func(eid int64) {
+		t.Helper()
+		approveAll(t, e, eid)
+		mustStatus(t, doJSON(e.h, "POST", base+"/executions/"+itoa(eid)+"/enqueue", e.editor, ""), http.StatusAccepted)
+		runOneJob(t, e.pool)
+	}
+
+	e1 := execID(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m1)+"/submit", e.editor, ""))
+	run(e1)
+
+	e2 := execID(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m2)+"/submit", e.editor, ""))
+	run(e2)
+	det := decode[struct {
+		Status           string  `json:"status"`
+		BatchesCommitted int     `json:"batches_committed"`
+		RowsProcessed    int64   `json:"rows_processed"`
+		LastCursor       string  `json:"last_cursor"`
+		JobStatus        *string `json:"job_status"`
+	}](t, mustStatus(t, doJSON(e.h, "GET", base+"/executions/"+itoa(e2), e.editor, ""), http.StatusOK))
+	if det.Status != "partial" || det.BatchesCommitted != 1 || det.RowsProcessed != 2 || det.LastCursor != "2" || det.JobStatus == nil || *det.JobStatus != "failed" {
+		t.Fatalf("partial v2 salah: %+v", det)
+	}
+
+	run(execID(t, doJSON(e.h, "POST", base+"/executions/"+itoa(e2)+"/compensate", e.editor, "")))
+	rb1 := execID(t, doJSON(e.h, "POST", base+"/migrations/"+itoa(m1)+"/rollback", e.editor, ""))
+	run(rb1)
+
+	for _, ex := range decode[[]struct{ ID int64 }](t, mustStatus(t, doJSON(e.h, "GET", base+"/executions?hide_rollback=true", e.editor, ""), http.StatusOK)) {
+		if ex.ID == e1 || ex.ID == rb1 {
+			t.Fatalf("hide_rollback gagal menyembunyikan #%d/#%d", e1, rb1)
+		}
+	}
+
+	enqueueTraces := map[string]bool{}
+	for _, s := range spans.Ended() {
+		if s.Name() == "POST /api/databases/{id}/executions/{eid}/enqueue" {
+			enqueueTraces[s.SpanContext().TraceID().String()] = true
+		}
+	}
+	linked := false
+	for _, s := range spans.Ended() {
+		if s.Name() == "worker.job" && enqueueTraces[s.SpanContext().TraceID().String()] {
+			linked = true
+		}
+	}
+	if !linked {
+		t.Fatal("trace API enqueue tidak tersambung ke worker.job")
+	}
+
+	var sawHTTPActor, sawWorkerAttrs bool
+	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if rec["msg"] == "http.request" && rec["actor"] == "editor" {
+			sawHTTPActor = true
+		}
+		if rec["msg"] == "worker.job_claimed" && rec["database_id"] == float64(e.dbID) && rec["trace_id"] != nil {
+			sawWorkerAttrs = true
+		}
+	}
+	if !sawHTTPActor || !sawWorkerAttrs {
+		t.Fatalf("log korelasi kurang: httpActor=%v workerAttrs=%v", sawHTTPActor, sawWorkerAttrs)
+	}
 }

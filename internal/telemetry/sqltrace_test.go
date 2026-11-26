@@ -87,3 +87,25 @@ func TestActorFromSessionFunc(t *testing.T) {
 		t.Fatalf("actor dari session tidak dipakai: %v", start)
 	}
 }
+
+func TestQueryTracerPointerParamsAndHandlerAttrs(t *testing.T) {
+	cursor := "120"
+	var nilPtr *string
+	start, _ := traceOnce(t, context.Background(), "SELECT $1, $2", []any{&cursor, nilPtr}, "SELECT 1", nil)
+	p, _ := start["params"].([]any)
+	if len(p) != 2 || p[0] != "120" || p[1] != "NULL" {
+		t.Fatalf("pointer params harus di-dereference, dapat %v", start["params"])
+	}
+
+	var buf bytes.Buffer
+	ctx := WithActor(context.Background(), "ani")
+	ctx = WithAttrs(ctx, slog.Int64("database_id", 7), slog.Int64("execution_id", 99))
+	NewLogger(&buf).InfoContext(ctx, "migration.batch_committed", "batch", 2)
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec["actor"] != "ani" || rec["database_id"] != float64(7) || rec["execution_id"] != float64(99) || rec["batch"] != float64(2) {
+		t.Fatalf("atribut konteks hilang di log non-SQL: %v", rec)
+	}
+}

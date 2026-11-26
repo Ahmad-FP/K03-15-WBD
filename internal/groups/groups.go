@@ -55,21 +55,9 @@ type groupPayload struct {
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.DB.Query(r.Context(), `SELECT g.id, g.name, g.description, g.leader_id, COALESCE(u.username, '')
+	httpx.WriteList[Group](w, r, h.DB, "gagal mengambil group",
+		`SELECT g.id, g.name, g.description, g.leader_id, COALESCE(u.username, '')
 		FROM platform_groups g LEFT JOIN users u ON u.id = g.leader_id ORDER BY g.name`)
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "gagal mengambil group")
-		return
-	}
-	result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Group])
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "gagal membaca group")
-		return
-	}
-	if result == nil {
-		result = []Group{}
-	}
-	httpx.JSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
@@ -113,22 +101,24 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var g Group
+	var oldLeader *int64
 	err := h.DB.QueryRow(r.Context(), `
 		WITH g AS (
-			UPDATE platform_groups
+			UPDATE platform_groups p
 			SET name = $2, description = $3,
-				leader_id = CASE WHEN $4 THEN $5 ELSE leader_id END,
+				leader_id = CASE WHEN $4 THEN $5 ELSE p.leader_id END,
 				updated_at = now()
-			WHERE id = $1
-			RETURNING *
+			FROM (SELECT id, leader_id FROM platform_groups WHERE id = $1 FOR UPDATE) old
+			WHERE p.id = old.id
+			RETURNING p.id, p.name, p.description, p.leader_id, old.leader_id AS old_leader_id
 		), m AS (
 			INSERT INTO group_members (group_id, user_id)
 			SELECT id, leader_id FROM g WHERE $4 AND leader_id IS NOT NULL ON CONFLICT DO NOTHING
 		)
-		SELECT g.id, g.name, g.description, g.leader_id, COALESCE(u.username, '')
+		SELECT g.id, g.name, g.description, g.leader_id, COALESCE(u.username, ''), g.old_leader_id
 		FROM g LEFT JOIN users u ON u.id = g.leader_id`,
 		id, p.Name, p.Description, p.LeaderID.set, p.LeaderID.val).
-		Scan(&g.ID, &g.Name, &g.Description, &g.LeaderID, &g.LeaderUsername)
+		Scan(&g.ID, &g.Name, &g.Description, &g.LeaderID, &g.LeaderUsername, &oldLeader)
 	if errors.Is(err, pgx.ErrNoRows) {
 		httpx.Error(w, http.StatusNotFound, "group tidak ditemukan")
 		return
@@ -141,8 +131,13 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "gagal memperbarui group")
 		return
 	}
-	if p.LeaderID.set && g.LeaderID != nil {
-		h.Sessions.RotateUser(r.Context(), *g.LeaderID)
+	if p.LeaderID.set {
+		if oldLeader != nil && (g.LeaderID == nil || *oldLeader != *g.LeaderID) {
+			h.Sessions.RevokeUser(r.Context(), *oldLeader)
+		}
+		if g.LeaderID != nil {
+			h.Sessions.RotateUser(r.Context(), *g.LeaderID)
+		}
 	}
 	httpx.JSON(w, http.StatusOK, g)
 }
@@ -153,13 +148,8 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.Sessions.RevokeGroup(r.Context(), id)
-	tag, err := h.DB.Exec(r.Context(), `DELETE FROM platform_groups WHERE id = $1`, id)
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "group tidak dapat dihapus")
-		return
-	}
-	if tag.RowsAffected() == 0 {
-		httpx.Error(w, http.StatusNotFound, "group tidak ditemukan")
+	if !httpx.ExecFound(w, r, h.DB, "group tidak ditemukan", "group tidak dapat dihapus",
+		`DELETE FROM platform_groups WHERE id = $1`, id) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -170,20 +160,8 @@ func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `SELECT u.id, u.username FROM group_members gm JOIN users u ON u.id = gm.user_id WHERE gm.group_id = $1 ORDER BY u.username`, id)
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "gagal mengambil anggota")
-		return
-	}
-	result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Member])
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "gagal membaca anggota")
-		return
-	}
-	if result == nil {
-		result = []Member{}
-	}
-	httpx.JSON(w, http.StatusOK, result)
+	httpx.WriteList[Member](w, r, h.DB, "gagal mengambil anggota",
+		`SELECT u.id, u.username FROM group_members gm JOIN users u ON u.id = gm.user_id WHERE gm.group_id = $1 ORDER BY u.username`, id)
 }
 
 func (h *Handler) AddMember(w http.ResponseWriter, r *http.Request) {

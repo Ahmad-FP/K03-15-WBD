@@ -10,11 +10,12 @@ import (
 
 func TestRedact(t *testing.T) {
 	cases := map[string]string{
-		"postgres://app:s3cret@db:5432/x":      "postgres://app:[REDACTED]@db:5432/x",
-		"host=db user=app password=s3cret":     "host=db user=app password=[REDACTED]",
-		"host=db password='a b' dbname=x":      "host=db password=[REDACTED] dbname=x",
-		"SELECT * FROM users WHERE id = $1":    "SELECT * FROM users WHERE id = $1",
-		"gagal: postgresql://u:p@h/db timeout": "gagal: postgresql://u:[REDACTED]@h/db timeout",
+		"postgres://app:s3cret@db:5432/x":            "postgres://app:[REDACTED]@db:5432/x",
+		"host=db user=app password=s3cret":           "host=db user=app password=[REDACTED]",
+		"host=db password='a b' dbname=x":            "host=db password=[REDACTED] dbname=x",
+		"SELECT * FROM users WHERE id = $1":          "SELECT * FROM users WHERE id = $1",
+		"gagal: postgresql://u:p@h/db timeout":       "gagal: postgresql://u:[REDACTED]@h/db timeout",
+		"ALTER ROLE app WITH PASSWORD 'supersecret'": "ALTER ROLE app WITH PASSWORD '[REDACTED]'",
 	}
 	for in, want := range cases {
 		if got := Redact(in); got != want {

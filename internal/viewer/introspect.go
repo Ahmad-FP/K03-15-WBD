@@ -6,10 +6,14 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Ahmad-FP/K03-15-WBD/internal/httpx"
 	"github.com/jackc/pgx/v5"
 )
 
 var errNoTable = errors.New("table tidak ditemukan")
+
+const userSchemaFilter = `n.nspname NOT IN ('pg_catalog', 'information_schema')
+	AND n.nspname NOT LIKE 'pg\_toast%' AND n.nspname NOT LIKE 'pg\_temp%'`
 
 type schemaInfo struct {
 	Name   string      `json:"name"`
@@ -41,13 +45,23 @@ type index struct {
 	Primary    bool   `json:"primary"`
 }
 
-// ambil semua schema user beserta table/view di dalamnya
+type tableDetail struct {
+	Schema      string       `json:"schema"`
+	Table       string       `json:"table"`
+	Kind        string       `json:"kind"`
+	Columns     []column     `json:"columns"`
+	Constraints []constraint `json:"constraints"`
+	Indexes     []index      `json:"indexes"`
+	Data        [][]any      `json:"data"`
+	HasNext     bool         `json:"has_next"`
+	Page        int          `json:"page"`
+}
+
 func listSchemas(ctx context.Context, tx pgx.Tx) ([]schemaInfo, error) {
 	rows, err := tx.Query(ctx, `SELECT n.nspname, COALESCE(c.relname, ''), COALESCE(c.relkind::text, '')
 		FROM pg_namespace n
 		LEFT JOIN pg_class c ON c.relnamespace = n.oid AND c.relkind IN ('r','p','v','m') AND NOT c.relispartition
-		WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-			AND n.nspname NOT LIKE 'pg\_toast%' AND n.nspname NOT LIKE 'pg\_temp%'
+		WHERE `+userSchemaFilter+`
 		ORDER BY 1, 2`)
 	if err != nil {
 		return nil, err
@@ -70,95 +84,79 @@ func listSchemas(ctx context.Context, tx pgx.Tx) ([]schemaInfo, error) {
 	return out, rows.Err()
 }
 
-// cari oid dan jenis relasi dari nama schema + table
+func loadTable(ctx context.Context, tx pgx.Tx, schema, name string, page int) (tableDetail, error) {
+	oid, kind, err := findTable(ctx, tx, schema, name)
+	if err != nil {
+		return tableDetail{}, err
+	}
+	cols, err := listColumns(ctx, tx, oid)
+	if err != nil {
+		return tableDetail{}, err
+	}
+	cons, err := listConstraints(ctx, tx, oid)
+	if err != nil {
+		return tableDetail{}, err
+	}
+	idx, err := listIndexes(ctx, tx, oid)
+	if err != nil {
+		return tableDetail{}, err
+	}
+	data, hasNext, err := readRows(ctx, tx, schema, name, oid, page)
+	if err != nil {
+		return tableDetail{}, err
+	}
+	return tableDetail{schema, name, kind, cols, cons, idx, data, hasNext, page}, nil
+}
+
 func findTable(ctx context.Context, tx pgx.Tx, schema, table string) (oid uint32, kind string, err error) {
 	err = tx.QueryRow(ctx, `SELECT c.oid, c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','v','m')`, schema, table).Scan(&oid, &kind)
+		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','v','m') AND `+userSchemaFilter,
+		schema, table).Scan(&oid, &kind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, "", errNoTable
 	}
 	return oid, relKind(kind), err
 }
 
-// kolom table sesuai urutan aslinya
 func listColumns(ctx context.Context, tx pgx.Tx, oid uint32) ([]column, error) {
-	rows, err := tx.Query(ctx, `SELECT a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
+	return httpx.Collect[column](ctx, tx, `SELECT a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
 			COALESCE(pg_get_expr(d.adbin, d.adrelid), '')
 		FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 		WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
 		ORDER BY a.attnum`, oid)
-	if err != nil {
-		return nil, err
-	}
-	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[column])
-	if list == nil {
-		list = []column{}
-	}
-	return list, err
 }
 
-// constraint table (PK, FK, unique, check, dll)
 func listConstraints(ctx context.Context, tx pgx.Tx, oid uint32) ([]constraint, error) {
-	rows, err := tx.Query(ctx, `SELECT conname, contype::text, pg_get_constraintdef(oid)
+	list, err := httpx.Collect[constraint](ctx, tx, `SELECT conname, contype::text, pg_get_constraintdef(oid)
 		FROM pg_constraint WHERE conrelid = $1 ORDER BY contype, conname`, oid)
-	if err != nil {
-		return nil, err
-	}
-	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[constraint])
-	if list == nil {
-		list = []constraint{}
-	}
 	for i := range list {
 		list[i].Type = constraintType(list[i].Type)
 	}
 	return list, err
 }
 
-// index yang nempel di table
 func listIndexes(ctx context.Context, tx pgx.Tx, oid uint32) ([]index, error) {
-	rows, err := tx.Query(ctx, `SELECT i.relname, pg_get_indexdef(ix.indexrelid), ix.indisunique, ix.indisprimary
+	return httpx.Collect[index](ctx, tx, `SELECT i.relname, pg_get_indexdef(ix.indexrelid), ix.indisunique, ix.indisprimary
 		FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid
 		WHERE ix.indrelid = $1 ORDER BY i.relname`, oid)
-	if err != nil {
-		return nil, err
-	}
-	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[index])
-	if list == nil {
-		list = []index{}
-	}
-	return list, err
 }
 
-// terjemahin kode relkind postgres ke nama yang kebaca
+var relKinds = map[string]string{"r": "table", "p": "table", "v": "view", "m": "materialized view"}
+var constraintTypes = map[string]string{
+	"p": "PRIMARY KEY", "f": "FOREIGN KEY", "u": "UNIQUE",
+	"c": "CHECK", "x": "EXCLUDE", "t": "TRIGGER", "n": "NOT NULL",
+}
+
 func relKind(k string) string {
-	switch k {
-	case "r", "p":
-		return "table"
-	case "v":
-		return "view"
-	case "m":
-		return "materialized view"
+	if v, ok := relKinds[k]; ok {
+		return v
 	}
 	return k
 }
 
-// terjemahin kode contype postgres
 func constraintType(t string) string {
-	switch t {
-	case "p":
-		return "PRIMARY KEY"
-	case "f":
-		return "FOREIGN KEY"
-	case "u":
-		return "UNIQUE"
-	case "c":
-		return "CHECK"
-	case "x":
-		return "EXCLUDE"
-	case "t":
-		return "TRIGGER"
-	case "n":
-		return "NOT NULL"
+	if v, ok := constraintTypes[t]; ok {
+		return v
 	}
 	return t
 }
@@ -168,7 +166,6 @@ const (
 	maxCell  = 200
 )
 
-// kolom primary key, dipakai buat ngurutin data biar pagination stabil
 func primaryKey(ctx context.Context, tx pgx.Tx, oid uint32) ([]string, error) {
 	rows, err := tx.Query(ctx, `SELECT a.attname FROM pg_index i
 		JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
@@ -180,7 +177,6 @@ func primaryKey(ctx context.Context, tx pgx.Tx, oid uint32) ([]string, error) {
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
-// ambil isi table per halaman, nilainya pakai format text bawaan postgres
 func readRows(ctx context.Context, tx pgx.Tx, schema, table string, oid uint32, page int) ([][]any, bool, error) {
 	pk, err := primaryKey(ctx, tx, oid)
 	if err != nil {
@@ -217,7 +213,6 @@ func readRows(ctx context.Context, tx pgx.Tx, schema, table string, oid uint32, 
 	return out, hasNext, rows.Err()
 }
 
-// nilai NULL jadi nil (JSON null), yang kepanjangan dipotong biar tabel ga melebar
 func toCell(raw []byte) any {
 	if raw == nil {
 		return nil
@@ -229,7 +224,6 @@ func toCell(raw []byte) any {
 	return string(r)
 }
 
-// nomor halaman dari query string, minimal 1 dan dibatasin biar OFFSET ga overflow
 func parsePage(s string) int {
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 1 {

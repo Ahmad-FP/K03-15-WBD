@@ -1,66 +1,92 @@
 ## Run
 
-Min Version : >= Go 1.26.2  dan PostgreSQL.
+Prasyarat: Go >= 1.26.2, Node.js >= 20, PostgreSQL.
+
+1. Build SPA frontend:
+
+```sh
+cd frontend && npm ci && npm run build && cd ..
+```
+
+2. Jalankan API server dan worker (pakai `DATABASE_URL` dan `DATABASE_CREDENTIALS_KEY` yang sama):
 
 ```sh
 export DATABASE_URL=postgres://<user>:<password>@localhost:5432/app
-export DATABASE_CREDENTIALS_KEY=<64 char hex>
+export DATABASE_CREDENTIALS_KEY=$(openssl rand -hex 32)
 go run .
 ```
 
- http://localhost:8080 lalu login pakai `admin` / `admin`. 
+Di terminal terpisah, jalankan worker:
 
-`DATABASE_CREDENTIALS_KEY`  gunakan `openssl rand -hex 32` 
+```sh
+export WORKER_CONCURRENCY=4
+go run ./cmd/worker
+```
+
+Buka `http://localhost:8080` lalu login dengan akun default `admin` / `admin`.
+
+Untuk development frontend dengan hot reload:
+
+```sh
+cd frontend && npm run dev
+```
 
 ## Test
 
 ```sh
-TEST_DATABASE_URL=postgres://user:password@localhost:5432/test go test ./...
+TEST_DATABASE_URL=postgres://user:password@localhost:5432/test go test -race ./...
 ```
 
-## Session
+## Session & Akses
 
-| | Nilai |
-|---|---|
-| Idle timeout | 30 menit |
-| Absolute expiration | 24 jam sejak login |
-| Rotasi berkala | 15 menit |
-| Grace period ID lama | 60 detik |
-
-ID session rotasi kalau login, user dijadikan Platform Admin, user masuk group, akses group ke database diberikan atau berubah, dan tiap 15 menit. Absolute Expiration tidak terpengaruh.
-
-ID lama masih diterima selama grace period dan response-nya ngirim ID yang baru, jadi request yang barengan atau response yang hilang ga bikin logout.
-
-Session dihapus di backend ketika logout, user dihapus, status admin dicabut, user dikeluarkan dari group, akses group ke database dicabut, atau group dihapus.
-
-Password disimpan sebagai hash bcrypt. Cookie `session` pakai HttpOnly, SameSite=Lax, dan Secure kalau lewat HTTPS. Request yang ubah data dari origin lain ditolak sebagai perlindungan CSRF.
-
-## Akses Database
-
-Kalau user ada di beberapa group yang punya akses ke database yang sama, yang dipakai adalah level akses tertinggi ( view + edit > view only)
+- Session cookie `HttpOnly`, `SameSite=Lax`, `Secure` (HTTPS), proteksi CSRF cross-origin.
+- Idle timeout 30 menit, absolute expiration 24 jam, rotasi berkala 15 menit (grace period 60 detik).
+- Rotasi saat login, promosi admin, masuk group, perubahan akses/leader; dicabut saat logout, hapus user/group, cabut admin/akses, keluar group, atau demosi leader.
+- Jika user tergabung di beberapa group untuk database yang sama, level tertinggi yang berlaku (`view_edit > view_only`). Platform Admin tidak otomatis punya akses data database.
 
 ## Database Viewer
 
-User biasa buka `/databases` buat lihat database yang bisa diakses lewat group-nya. Dari situ bisa lihat schema, table/view, kolom, constraint, index, dan isi data (50 baris per halaman, urut primary key kalau ada). Semua query viewer jalan di transaction read-only dengan `statement_timeout` 10 detik.
+Menampilkan schema, table/view, kolom, constraint, index, dan isi data (50 baris/halaman, urut primary key). Query berjalan dalam transaksi `READ ONLY` dengan `statement_timeout` 10 detik.
 
-Kalau database target ga bisa dihubungi, response-nya 502 tanpa nampilin detail koneksi. User tanpa akses ke database dapat 403 (termasuk Platform Admin, karena admin bukan tingkat akses database).
+## Migration, Approval & Worker
 
-## Migration
+- **Alur:** `Draft → Pending Review → Approved → Pending (Queue) → Running → Success / Failed / Partial / Partially Reverted`.
+- **Approval:** setiap perubahan (`up`, `rollback`, `forward`, `retry`, `compensate`) wajib disetujui leader semua group yang memiliki akses ke database (`view_only` maupun `view_edit`) dan direvalidasi ulang oleh worker setelah lock diperoleh.
+- **Immutability & History:** definisi migration yang pernah diajukan menjadi read-only. Semua attempt (berhasil maupun gagal) dicatat append-only di `migration_executions` beserta `sql_snapshot`, waktu, pengguna, dan status. Checkbox **Hide rollback** menyembunyikan pasangan eksekusi yang dibatalkan dan rollback suksesnya berdasarkan `execution_id` tanpa menghapus data riwayat.
+- **Normal & Batch Mode:** `batch_size = 0` berjalan dalam 1 transaksi; `batch_size > 0` memproses per batch dengan cursor (`$1 = last_cursor`, `$2 = batch_size`) dan menyimpan checkpoint `_wbd_checkpoints` pada transaksi yang sama. Jika gagal di tengah, status menjadi `partial` dan dapat dilanjutkan (`retry`) atau dibatalkan per batch terbalik (`compensate` → `partially_reverted` bila terhenti).
+- **Concurrency & Lock Recovery:** worker mengambil job via `FOR UPDATE SKIP LOCKED` dan memegang session advisory lock `pg_try_advisory_lock(3110, database_id)` lintas batch (1 migration per database, paralel untuk database berbeda). Karena lock bersifat session-level, jika worker mati/crash PostgreSQL melepas lock otomatis; worker lain memulihkan job `running` yatim saat start dan tiap 30 detik (`Recover`), lalu memeriksa `_wbd_checkpoints` sebelum eksekusi ulang agar tidak terjadi double commit.
+- **Retry otomatis:** kegagalan sementara (koneksi putus, deadlock, lock unavailable) dicoba ulang hingga `max_attempts` (default 3) dengan backoff eksponensial (2s, 4s, … maks 1m) sebagai baris attempt baru.
 
-| | Aturan |
+## Benchmark
+
+Dataset: tabel `items` berisi **2.000.000 baris** (`PostgreSQL 17`).
+
+| Skenario | Hasil |
 |---|---|
-| Lihat riwayat & detail | View Only atau View + Edit |
-| Buat, ubah, hapus, jalankan | View + Edit |
-| Versi | Nomor urut per database (v1, v2, ...) |
-| Pending | Maksimal satu migration yang belum sukses per database |
-| Setelah sukses | Tidak bisa diubah atau dihapus |
+| `UPDATE items SET status = 'migrated'` tanpa batch | **16,0 detik** (2.000.000 baris) |
+| Worker mode batch (`batch_size = 50000`) | **56,0 detik** (40 batch, 2.000.000 baris, `success`) |
 
-- Riwayat linear: migration baru cuma bisa dibuat kalau migration sebelumnya sudah sukses, jadi urutan versi = urutan eksekusi.
-- Migration yang gagal tetap tercatat (status `failed` + pesan error) sampai diperbaiki lalu dijalankan ulang dengan versi yang sama, atau dihapus.
-- SQL dijalankan dalam satu transaction di database target dengan `statement_timeout` 60 detik. Kalau semua statement berhasil di-commit, kalau ada yang gagal di-rollback semua.
-- SQL tidak boleh berisi `BEGIN`/`COMMIT`/`ROLLBACK`/`END` karena transaction-nya diatur sistem. Statement yang memang tidak bisa jalan di dalam transaction (misal `CREATE INDEX CONCURRENTLY`) akan gagal dan di-rollback.
-- Yang dicatat: versi, nama, SQL, pembuat, pelaksana, waktu eksekusi, status, dan error terakhir.
+Reproduksi:
 
-## Worker Migration (Milestone 2)
+```sh
+WBD_BENCH_ROWS=2000000 WBD_BENCH_BATCH=50000 \
+TEST_DATABASE_URL="postgres://user:pass@localhost:5432/test?sslmode=disable" \
+go test ./internal/worker -run TestLargeDatasetBenchmark -v -timeout 30m
+```
 
-Eksekusi migration berjalan asynchronous lewat worker terpisah: `go run ./cmd/worker` dengan `DATABASE_URL` dan `DATABASE_CREDENTIALS_KEY` yang sama seperti API. Cara kerja lock, batch, retry, crash recovery, logging/tracing, hasil benchmark data besar, dan cara menjalankan test ada di [docs/worker.md](docs/worker.md).
+## Logging & Tracing
+
+Log JSON terstruktur (`log/slog`) ditulis ke **stdout** dan span OpenTelemetry (console exporter) ke **stderr**. Credential, DSN, password SQL, dan session disamarkan (`[REDACTED]`). Trace context W3C (`traceparent`) dipropagasikan dari HTTP API → `migration_jobs` → worker → lock → batch/SQL query.
+
+Contoh log JSON & span yang saling berkorelasi (`trace_id` sama):
+
+```json
+{"time":"2026-11-27T00:54:17.251974+07:00","level":"INFO","msg":"worker.job_claimed","trace_id":"ffb4ab5c023c8fc66624afcacf29a3fe","span_id":"4574f2d8784b6ad4","job_id":2,"execution_id":1,"database_id":1}
+{"time":"2026-11-27T00:54:17.278412+07:00","level":"INFO","msg":"migration.attempt.end","event":"migration.attempt.end","database_id":1,"job_id":2,"migration_id":1,"execution_id":1,"req_id":1,"version":1,"operation":"up","attempt":1,"actor":"ani","status":"success","sql_snapshot":"WITH batch AS (...) SELECT id::text AS last_cursor FROM upd ORDER BY id","duration_ms":15.236,"batches_committed":3,"rows_processed":25,"trace_id":"ffb4ab5c023c8fc66624afcacf29a3fe","span_id":"62e0e5602970e080"}
+```
+
+```json
+{"Name":"POST /api/databases/{id}/executions/{eid}/enqueue","SpanContext":{"TraceID":"ffb4ab5c023c8fc66624afcacf29a3fe","SpanID":"b80bbe78608f6b2d"}}
+{"Name":"worker.job","SpanContext":{"TraceID":"ffb4ab5c023c8fc66624afcacf29a3fe","SpanID":"a5ee1058c1bcf8f9"},"Parent":{"TraceID":"ffb4ab5c023c8fc66624afcacf29a3fe","SpanID":"b80bbe78608f6b2d","Remote":true},"Attributes":[{"Key":"job.id","Value":{"Type":"INT64","Value":2}},{"Key":"execution.id","Value":{"Type":"INT64","Value":1}},{"Key":"database.id","Value":{"Type":"INT64","Value":1}}]}
+{"Name":"worker.lock.held","SpanContext":{"TraceID":"ffb4ab5c023c8fc66624afcacf29a3fe","SpanID":"4574f2d8784b6ad4"},"Parent":{"TraceID":"ffb4ab5c023c8fc66624afcacf29a3fe","SpanID":"a5ee1058c1bcf8f9"}}
+```

@@ -15,9 +15,6 @@ import (
 // namespace advisory lock milik platform, key kedua = database_id
 const lockSpace = 3110
 
-// berapa kandidat job yang dicoba dalam satu kali claim sebelum menyerah
-const maxCandidates = 20
-
 // job yang sedang dipegang worker: koneksi khusus ini memegang advisory lock database-nya sampai Release
 type Job struct {
 	ID          int64
@@ -52,10 +49,10 @@ func claimOn(ctx context.Context, conn *pgxpool.Conn) (*Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.WithoutCancel(ctx))
 
 	busy := []int64{}
-	for range maxCandidates {
+	for ctx.Err() == nil {
 		var j Job
 		err := tx.QueryRow(ctx, `SELECT j.id, j.execution_id, e.database_id, j.traceparent
 			FROM migration_jobs j JOIN migration_executions e ON e.id = j.execution_id
@@ -82,14 +79,14 @@ func claimOn(ctx context.Context, conn *pgxpool.Conn) (*Job, error) {
 		}
 		if err != nil {
 			// transaksi claim batal, lock session-nya harus dilepas manual (rollback dulu biar koneksi bisa dipakai)
-			tx.Rollback(ctx)
+			_ = tx.Rollback(context.WithoutCancel(ctx))
 			unlock(context.WithoutCancel(ctx), conn, j.DatabaseID)
 			return nil, err
 		}
 		j.conn = conn
 		return &j, nil
 	}
-	return nil, nil
+	return nil, ctx.Err()
 }
 
 // lock level session: tetap dipegang setelah transaksi claim commit, sampai unlock eksplisit
@@ -118,11 +115,16 @@ func markRunning(ctx context.Context, tx pgx.Tx, j Job) error {
 func unlock(ctx context.Context, conn *pgxpool.Conn, databaseID int64) {
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock($1, $2::int)`, lockSpace, databaseID); err != nil {
 		slog.ErrorContext(ctx, "worker.unlock_failed", "database_id", databaseID, "error", err)
+		// tutup koneksi agar session advisory lock tidak ikut kembali ke pool
+		_ = conn.Conn().Close(ctx)
 	}
 }
 
 // transaksi di koneksi pemegang lock, dipakai untuk menulis status akhir sebelum Release
 func (j *Job) Begin(ctx context.Context) (pgx.Tx, error) {
+	if j.conn == nil {
+		return nil, errors.New("koneksi job sudah dilepas")
+	}
 	return j.conn.Begin(ctx)
 }
 
@@ -138,12 +140,15 @@ func (j *Job) Release(ctx context.Context) {
 
 // kembalikan job ke antrean (job & execution sama-sama pending) lalu lepas lock
 func (j *Job) Requeue(ctx context.Context, delaySeconds int) error {
+	if j.conn == nil {
+		return nil
+	}
 	defer j.Release(ctx)
 	tx, err := j.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.WithoutCancel(ctx))
 	if _, err := tx.Exec(ctx, `UPDATE migration_jobs SET status = 'pending', run_after = now() + make_interval(secs => $2), updated_at = now() WHERE id = $1`, j.ID, delaySeconds); err != nil {
 		return err
 	}

@@ -15,7 +15,26 @@ interface Props {
 }
 
 const TERMINAL_JOB_STATES = new Set(["done", "failed"]);
-const TERMINAL_EXEC_STATES = new Set(["success", "failed", "rejected"]);
+const TERMINAL_EXEC_STATES = new Set([
+  "success",
+  "failed",
+  "rejected",
+  "partial",
+  "partially_reverted",
+]);
+
+function isExecutionTerminal(detail: ExecutionDetail): boolean {
+  if (detail.job_status !== undefined && detail.job_status !== null) {
+    return TERMINAL_JOB_STATES.has(detail.job_status);
+  }
+  return TERMINAL_EXEC_STATES.has(detail.status);
+}
+
+function fmtTime(iso?: string | null): string {
+  if (!iso) return "-";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
 
 export const MigrationsPanel: React.FC<Props> = ({
   dbId,
@@ -25,6 +44,8 @@ export const MigrationsPanel: React.FC<Props> = ({
 }) => {
   const [migrations, setMigrations] = useState<MigrationItem[]>([]);
   const [selectedMid, setSelectedMid] = useState<number | null>(null);
+  const [selectedMigrationDetail, setSelectedMigrationDetail] =
+    useState<MigrationItem | null>(null);
   const [executions, setExecutions] = useState<ExecutionSummary[]>([]);
   const [hideRollback, setHideRollback] = useState<boolean>(false);
 
@@ -43,107 +64,154 @@ export const MigrationsPanel: React.FC<Props> = ({
   const [submittingForm, setSubmittingForm] = useState(false);
 
   const pollTimerRef = useRef<number | null>(null);
+  const dbIdRef = useRef<number>(dbId);
+  const hideRollbackRef = useRef<boolean>(hideRollback);
+  dbIdRef.current = dbId;
+  hideRollbackRef.current = hideRollback;
 
   const selectedMigration = useMemo(
-    () => migrations.find((m) => m.id === selectedMid) ?? null,
-    [migrations, selectedMid]
+    () =>
+      selectedMigrationDetail?.id === selectedMid
+        ? selectedMigrationDetail
+        : migrations.find((m) => m.id === selectedMid) ?? null,
+    [migrations, selectedMid, selectedMigrationDetail]
   );
 
   const loadMigrations = async (keepSelection = true) => {
+    const reqDb = dbId;
     try {
       const list = await apiRequest<MigrationItem[]>(
-        `/api/databases/${dbId}/migrations`
+        `/api/databases/${reqDb}/migrations`
       );
+      if (dbIdRef.current !== reqDb) return;
       setMigrations(list);
-      if (!keepSelection || !list.some((m) => m.id === selectedMid)) {
-        setSelectedMid(list[0]?.id ?? null);
-      }
+      setSelectedMid((prev) =>
+        keepSelection && prev !== null && list.some((m) => m.id === prev)
+          ? prev
+          : (list[0]?.id ?? null)
+      );
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : "Gagal memuat migrations", true);
+      if (dbIdRef.current === reqDb) {
+        onNotify(
+          err instanceof Error ? err.message : "Gagal memuat migrations",
+          true
+        );
+      }
     }
   };
 
-  const loadExecutions = async (hideRb = hideRollback) => {
+  const loadExecutions = async (
+    hideRb = hideRollbackRef.current,
+    resetSelection = false
+  ) => {
+    const reqDb = dbId;
     try {
       const list = await apiRequest<ExecutionSummary[]>(
-        `/api/databases/${dbId}/executions?hide_rollback=${hideRb ? "true" : "false"}`
+        `/api/databases/${reqDb}/executions?hide_rollback=${hideRb ? "true" : "false"}`
       );
+      if (dbIdRef.current !== reqDb) return;
       setExecutions(list);
-      if (list.length > 0 && selectedEid === null) {
-        setSelectedEid(list[0].id);
-      }
+      setSelectedEid((prev) => {
+        if (resetSelection || prev === null) return list[0]?.id ?? null;
+        return prev;
+      });
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : "Gagal memuat riwayat eksekusi", true);
+      if (dbIdRef.current === reqDb) {
+        onNotify(
+          err instanceof Error ? err.message : "Gagal memuat riwayat eksekusi",
+          true
+        );
+      }
     }
   };
 
   const fetchExecutionDetail = async (
     eid: number,
-    followLatest = true
+    followLatest = false
   ): Promise<ExecutionDetail | null> => {
+    const reqDb = dbId;
     try {
       let current = await apiRequest<ExecutionDetail>(
-        `/api/databases/${dbId}/executions/${eid}`
+        `/api/databases/${reqDb}/executions/${eid}`
       );
+      if (dbIdRef.current !== reqDb) return null;
       if (
         followLatest &&
         current.latest_execution_id &&
         current.latest_execution_id !== current.id
       ) {
         current = await apiRequest<ExecutionDetail>(
-          `/api/databases/${dbId}/executions/${current.latest_execution_id}`
+          `/api/databases/${reqDb}/executions/${current.latest_execution_id}`
         );
+        if (dbIdRef.current !== reqDb) return null;
         setSelectedEid(current.id);
       }
       setExecDetail(current);
 
-      const jobDone =
-        current.job_status !== undefined &&
-        current.job_status !== null &&
-        TERMINAL_JOB_STATES.has(current.job_status);
-
-      const execDoneWithoutJob =
-        (current.job_status === undefined || current.job_status === null) &&
-        TERMINAL_EXEC_STATES.has(current.status);
-
-      if (jobDone || execDoneWithoutJob) {
+      if (isExecutionTerminal(current)) {
         setPollingActive(false);
-        await loadExecutions(hideRollback);
+        await loadExecutions(hideRollbackRef.current);
         await loadMigrations(true);
       }
       return current;
     } catch (err) {
-      setPollingActive(false);
-      onNotify(
-        err instanceof Error ? err.message : "Gagal memuat detail eksekusi",
-        true
-      );
+      if (dbIdRef.current === reqDb) {
+        setPollingActive(false);
+        onNotify(
+          err instanceof Error ? err.message : "Gagal memuat detail eksekusi",
+          true
+        );
+      }
       return null;
     }
   };
 
   useEffect(() => {
     setSelectedMid(null);
+    setSelectedMigrationDetail(null);
     setSelectedEid(null);
     setExecDetail(null);
     setPollingActive(false);
     resetForm();
     void loadMigrations(false);
-    void loadExecutions(hideRollback);
+    void loadExecutions(hideRollbackRef.current, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dbId]);
 
+  const didMountRef = useRef(false);
   useEffect(() => {
+    if (!didMountRef.current) {
+      didMountRef.current = true;
+      return;
+    }
     void loadExecutions(hideRollback);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hideRollback]);
 
   useEffect(() => {
+    if (selectedMid === null) {
+      setSelectedMigrationDetail(null);
+      return;
+    }
+    let active = true;
+    apiRequest<MigrationItem>(`/api/databases/${dbId}/migrations/${selectedMid}`)
+      .then((res) => {
+        if (active) setSelectedMigrationDetail(res);
+      })
+      .catch(() => {
+        if (active) setSelectedMigrationDetail(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [dbId, selectedMid, executions]);
+
+  useEffect(() => {
     if (selectedEid !== null) {
-      void fetchExecutionDetail(selectedEid, true);
+      void fetchExecutionDetail(selectedEid, false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedEid]);
+  }, [dbId, selectedEid]);
 
   useEffect(() => {
     if (pollTimerRef.current !== null) {
@@ -177,7 +245,10 @@ export const MigrationsPanel: React.FC<Props> = ({
 
   const startEditMigration = (m: MigrationItem) => {
     if (m.immutable) {
-      onNotify("Migration bersifat immutable karena sudah pernah dieksekusi.", true);
+      onNotify(
+        "Migration bersifat immutable karena sudah pernah dieksekusi.",
+        true
+      );
       return;
     }
     setEditingMid(m.id);
@@ -199,7 +270,7 @@ export const MigrationsPanel: React.FC<Props> = ({
         sql_down: irreversibleReason.trim() ? "" : sqlDown,
         irreversible_reason: irreversibleReason.trim(),
         batch_column: batchSize > 0 ? batchColumn.trim() : "",
-        batch_size: Number(batchSize) || 0,
+        batch_size: Math.max(0, Math.floor(Number(batchSize) || 0)),
       };
       if (editingMid !== null) {
         const updated = await apiRequest<MigrationItem>(
@@ -234,10 +305,14 @@ export const MigrationsPanel: React.FC<Props> = ({
         method: "DELETE",
       });
       onNotify(`Migration v${m.version} dihapus.`);
+      if (editingMid === m.id) resetForm();
       if (selectedMid === m.id) setSelectedMid(null);
       await loadMigrations(false);
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : "Gagal menghapus migration", true);
+      onNotify(
+        err instanceof Error ? err.message : "Gagal menghapus migration",
+        true
+      );
     }
   };
 
@@ -252,19 +327,22 @@ export const MigrationsPanel: React.FC<Props> = ({
         { method: "POST" }
       );
       onNotify(`${label} berhasil.`);
-      await loadExecutions(hideRollback);
+      await loadExecutions(hideRollbackRef.current);
       await loadMigrations(true);
 
-      const targetEid = res.execution_id ?? selectedEid;
+      const targetEid = res?.execution_id ?? selectedEid;
       if (targetEid) {
         setSelectedEid(targetEid);
-        await fetchExecutionDetail(targetEid, true);
-        if (startPolling) {
+        const detail = await fetchExecutionDetail(targetEid, startPolling);
+        if (startPolling && detail && !isExecutionTerminal(detail)) {
           setPollingActive(true);
         }
       }
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : `Gagal melakukan ${label}`, true);
+      onNotify(
+        err instanceof Error ? err.message : `Gagal melakukan ${label}`,
+        true
+      );
     }
   };
 
@@ -273,20 +351,25 @@ export const MigrationsPanel: React.FC<Props> = ({
     decision: "approved" | "rejected"
   ) => {
     try {
-      await apiRequest<void>(`/api/databases/${dbId}/executions/${eid}/approve`, {
-        method: "POST",
-        body: JSON.stringify({ decision }),
-      });
+      await apiRequest<void>(
+        `/api/databases/${dbId}/executions/${eid}/approve`,
+        {
+          method: "POST",
+          body: JSON.stringify({ decision }),
+        }
+      );
       onNotify(
         decision === "approved"
           ? "Execution disetujui."
           : "Execution ditolak."
       );
-      await fetchExecutionDetail(eid, true);
-      await loadExecutions(hideRollback);
+      await fetchExecutionDetail(eid, false);
+      await loadExecutions(hideRollbackRef.current);
     } catch (err) {
       onNotify(
-        err instanceof Error ? err.message : "Gagal memproses keputusan approval",
+        err instanceof Error
+          ? err.message
+          : "Gagal memproses keputusan approval",
         true
       );
     }
@@ -296,10 +379,36 @@ export const MigrationsPanel: React.FC<Props> = ({
     editingMid !== null &&
     migrations.find((m) => m.id === editingMid)?.immutable === true;
 
-  const canRetryOrCompensate =
+  const execMigration = execDetail
+    ? migrations.find((m) => m.id === execDetail.migration_id) ?? null
+    : null;
+  const execRootId = execDetail
+    ? execDetail.parent_execution_id ?? execDetail.request_id ?? execDetail.id
+    : null;
+  const isUnresolvedPartial =
     execDetail !== null &&
     (execDetail.status === "partial" ||
-      execDetail.status === "partially_reverted");
+      execDetail.status === "partially_reverted") &&
+    !executions.some((r) => {
+      const rRoot = r.parent_execution_id ?? r.request_id ?? r.id;
+      return (
+        r.id > execDetail.id &&
+        rRoot === execRootId &&
+        (r.status === "success" ||
+          r.status === "partial" ||
+          r.status === "partially_reverted")
+      );
+    });
+  const isExecReversible =
+    execMigration !== null &&
+    !execMigration.irreversible_reason &&
+    Boolean(execMigration.sql_down.trim());
+  const canRetry =
+    execDetail !== null &&
+    execDetail.status === "partial" &&
+    isUnresolvedPartial;
+  const canCompensate =
+    execDetail !== null && isUnresolvedPartial && isExecReversible;
 
   return (
     <div className="stack-lg">
@@ -313,7 +422,11 @@ export const MigrationsPanel: React.FC<Props> = ({
                 : "Buat Migration Baru"}
             </h3>
             {editingMid !== null && (
-              <button type="button" className="btn-secondary" onClick={resetForm}>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={resetForm}
+              >
                 Batal Edit
               </button>
             )}
@@ -325,6 +438,7 @@ export const MigrationsPanel: React.FC<Props> = ({
               <input
                 type="text"
                 required
+                maxLength={100}
                 disabled={isEditingImmutable}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
@@ -337,6 +451,7 @@ export const MigrationsPanel: React.FC<Props> = ({
                 Batch Column (wajib jika batch_size &gt; 0)
                 <input
                   type="text"
+                  required={batchSize > 0}
                   disabled={isEditingImmutable || batchSize <= 0}
                   value={batchColumn}
                   onChange={(e) => setBatchColumn(e.target.value)}
@@ -349,9 +464,14 @@ export const MigrationsPanel: React.FC<Props> = ({
                 <input
                   type="number"
                   min={0}
+                  step={1}
                   disabled={isEditingImmutable}
                   value={batchSize}
-                  onChange={(e) => setBatchSize(Math.max(0, Number(e.target.value)))}
+                  onChange={(e) =>
+                    setBatchSize(
+                      Math.max(0, Math.floor(Number(e.target.value) || 0))
+                    )
+                  }
                 />
               </label>
             </div>
@@ -416,7 +536,11 @@ export const MigrationsPanel: React.FC<Props> = ({
       <section className="card">
         <div className="card-header">
           <h3>Daftar Migration</h3>
-          <button type="button" className="btn-secondary" onClick={() => void loadMigrations(true)}>
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => void loadMigrations(true)}
+          >
             Refresh
           </button>
         </div>
@@ -478,7 +602,7 @@ export const MigrationsPanel: React.FC<Props> = ({
                             Submit
                           </button>
 
-                          {!isIrreversible && (
+                          {m.immutable && !isIrreversible && (
                             <button
                               type="button"
                               className="btn-secondary btn-sm"
@@ -530,15 +654,56 @@ export const MigrationsPanel: React.FC<Props> = ({
 
         {selectedMigration && (
           <div className="detail-box">
-            <h4>SQL Preview — v{selectedMigration.version} ({selectedMigration.name})</h4>
+            <div className="card-header">
+              <h4>
+                SQL Preview — v{selectedMigration.version} (
+                {selectedMigration.name})
+              </h4>
+              {canEdit && (
+                <div className="actions-row">
+                  {selectedMigration.can_forward && (
+                    <button
+                      type="button"
+                      className="btn-primary btn-sm"
+                      onClick={() =>
+                        void handleWorkflowRequest(
+                          `/api/databases/${dbId}/migrations/${selectedMigration.id}/submit`,
+                          `Forward v${selectedMigration.version}`
+                        )
+                      }
+                    >
+                      Forward v{selectedMigration.version}
+                    </button>
+                  )}
+                  {selectedMigration.can_rollback && (
+                    <button
+                      type="button"
+                      className="btn-secondary btn-sm"
+                      onClick={() =>
+                        void handleWorkflowRequest(
+                          `/api/databases/${dbId}/migrations/${selectedMigration.id}/rollback`,
+                          `Rollback v${selectedMigration.version}`
+                        )
+                      }
+                    >
+                      Rollback v{selectedMigration.version}
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
             <div className="sql-scroll">
-              <pre><code>{selectedMigration.sql_up}</code></pre>
+              <pre>
+                <code>{selectedMigration.sql_up}</code>
+              </pre>
             </div>
             {selectedMigration.sql_down && (
               <>
                 <h5>SQL Down</h5>
                 <div className="sql-scroll">
-                  <pre><code>{selectedMigration.sql_down}</code></pre>
+                  <pre>
+                    <code>{selectedMigration.sql_down}</code>
+                  </pre>
                 </div>
               </>
             )}
@@ -552,19 +717,31 @@ export const MigrationsPanel: React.FC<Props> = ({
           <div className="card-header">
             <div>
               <h3>
-                Execution #{execDetail.id} (Latest #{execDetail.latest_execution_id})
+                Execution #{execDetail.id} (Latest #
+                {execDetail.latest_execution_id})
               </h3>
               <p className="muted">
-                v{execDetail.version} • {execDetail.operation} • attempt #{execDetail.attempt} •
-                status: <strong>{execDetail.status}</strong>
-                {execDetail.job_status ? ` • job: ${execDetail.job_status}` : ""}
+                m#{execDetail.migration_id} • v{execDetail.version} • {execDetail.operation} • attempt #
+                {execDetail.attempt} • status:{" "}
+                <strong>{execDetail.status}</strong>
+                {execDetail.job_id ? ` • job #${execDetail.job_id}` : ""}
+                {execDetail.job_status ? ` (${execDetail.job_status})` : ""}
               </p>
             </div>
             <div className="actions-row">
+              {execDetail.latest_execution_id !== execDetail.id && (
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  onClick={() => setSelectedEid(execDetail.latest_execution_id)}
+                >
+                  Ke Attempt Terbaru (#{execDetail.latest_execution_id})
+                </button>
+              )}
               <button
                 type="button"
                 className="btn-secondary btn-sm"
-                onClick={() => void fetchExecutionDetail(execDetail.id, true)}
+                onClick={() => void fetchExecutionDetail(execDetail.id, false)}
               >
                 Cek Status
               </button>
@@ -581,22 +758,40 @@ export const MigrationsPanel: React.FC<Props> = ({
           <div className="metrics-grid">
             <div>
               <span className="muted">Batches Committed</span>
-              <div><strong>{execDetail.batches_committed}</strong></div>
+              <div>
+                <strong>{execDetail.batches_committed}</strong>
+              </div>
             </div>
             <div>
               <span className="muted">Rows Processed</span>
-              <div><strong>{execDetail.rows_processed}</strong></div>
+              <div>
+                <strong>{execDetail.rows_processed}</strong>
+              </div>
             </div>
             <div>
               <span className="muted">Last Cursor</span>
-              <div><code>{execDetail.last_cursor ?? "-"}</code></div>
+              <div>
+                <code>{execDetail.last_cursor || "-"}</code>
+              </div>
             </div>
             <div>
               <span className="muted">Request / Parent / Reverted</span>
               <div>
                 <code>
-                  req:{execDetail.request_id ?? execDetail.id} / par:{execDetail.parent_execution_id ?? "-"} / rev:{execDetail.reverted_execution_id ?? "-"}
+                  req:{execDetail.request_id ?? execDetail.id} / par:
+                  {execDetail.parent_execution_id ?? "-"} / rev:
+                  {execDetail.reverted_execution_id ?? "-"}
                 </code>
+              </div>
+            </div>
+            <div>
+              <span className="muted">Dibuat / Mulai / Selesai</span>
+              <div>
+                <small>
+                  {fmtTime(execDetail.created_at)} /{" "}
+                  {fmtTime(execDetail.started_at)} /{" "}
+                  {fmtTime(execDetail.finished_at)}
+                </small>
               </div>
             </div>
           </div>
@@ -640,35 +835,34 @@ export const MigrationsPanel: React.FC<Props> = ({
                 </button>
               )}
 
-              {canRetryOrCompensate && (
-                <>
-                  <button
-                    type="button"
-                    className="btn-primary"
-                    onClick={() =>
-                      void handleWorkflowRequest(
-                        `/api/databases/${dbId}/executions/${execDetail.id}/retry`,
-                        `Retry #${execDetail.id}`,
-                        true
-                      )
-                    }
-                  >
-                    Retry
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-secondary"
-                    onClick={() =>
-                      void handleWorkflowRequest(
-                        `/api/databases/${dbId}/executions/${execDetail.id}/compensate`,
-                        `Compensate #${execDetail.id}`,
-                        true
-                      )
-                    }
-                  >
-                    Compensate
-                  </button>
-                </>
+              {canRetry && (
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={() =>
+                    void handleWorkflowRequest(
+                      `/api/databases/${dbId}/executions/${execDetail.id}/retry`,
+                      `Retry #${execDetail.id}`
+                    )
+                  }
+                >
+                  Retry
+                </button>
+              )}
+
+              {canCompensate && (
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() =>
+                    void handleWorkflowRequest(
+                      `/api/databases/${dbId}/executions/${execDetail.id}/compensate`,
+                      `Compensate #${execDetail.id}`
+                    )
+                  }
+                >
+                  Compensate
+                </button>
               )}
             </div>
           )}
@@ -684,6 +878,7 @@ export const MigrationsPanel: React.FC<Props> = ({
                     <th>Leader</th>
                     <th>Status</th>
                     <th>Decided By</th>
+                    <th>Waktu</th>
                     <th>Aksi Leader</th>
                   </tr>
                 </thead>
@@ -694,14 +889,15 @@ export const MigrationsPanel: React.FC<Props> = ({
                     const canDecide =
                       execDetail.status === "pending_review" &&
                       ap.status === "pending" &&
-                      (isLeaderOfThisGroup || currentUser.is_admin);
+                      isLeaderOfThisGroup;
 
                     return (
                       <tr key={ap.group_id}>
                         <td>{ap.group_name}</td>
-                        <td>{ap.leader_username ?? "-"}</td>
+                        <td>{ap.leader_username || "-"}</td>
                         <td>{ap.status}</td>
-                        <td>{ap.decided_by_username ?? "-"}</td>
+                        <td>{ap.decided_by_username || "-"}</td>
+                        <td>{fmtTime(ap.decided_at)}</td>
                         <td className="cell-actions">
                           {canDecide ? (
                             <>
@@ -740,7 +936,9 @@ export const MigrationsPanel: React.FC<Props> = ({
             <div className="subsection">
               <h4>SQL Snapshot</h4>
               <div className="sql-scroll">
-                <pre><code>{execDetail.sql_snapshot}</code></pre>
+                <pre>
+                  <code>{execDetail.sql_snapshot}</code>
+                </pre>
               </div>
             </div>
           )}
@@ -772,6 +970,7 @@ export const MigrationsPanel: React.FC<Props> = ({
                 <th>Status</th>
                 <th>Batches / Rows</th>
                 <th>Requested By</th>
+                <th>Waktu</th>
                 <th>Detail</th>
               </tr>
             </thead>
@@ -796,7 +995,8 @@ export const MigrationsPanel: React.FC<Props> = ({
                   <td>
                     {ex.batches_committed} / {ex.rows_processed}
                   </td>
-                  <td>{ex.requested_by_username ?? "-"}</td>
+                  <td>{ex.requested_by_username || "-"}</td>
+                  <td>{fmtTime(ex.created_at)}</td>
                   <td>
                     <button
                       type="button"
@@ -815,7 +1015,7 @@ export const MigrationsPanel: React.FC<Props> = ({
               ))}
               {executions.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="muted">
+                  <td colSpan={9} className="muted">
                     Tidak ada riwayat eksekusi.
                   </td>
                 </tr>

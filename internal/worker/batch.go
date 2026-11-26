@@ -8,7 +8,6 @@ import (
 	"github.com/Ahmad-FP/K03-15-WBD/internal/telemetry"
 	"github.com/jackc/pgx/v5"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -19,17 +18,24 @@ type progress struct {
 	cursor  *string // nil = belum ada batch, mulai dari awal
 }
 
+func cursorVal(c *string) string {
+	if c == nil {
+		return ""
+	}
+	return *c
+}
+
 // mode batch (up/forward/retry): tiap batch transaksi sendiri + checkpoint di transaksi yang sama.
 // sql_snapshot menerima $1 = last_cursor (NULL di batch pertama) dan $2 = batch_size,
 // lalu mengembalikan kolom cursor yang terurut dari tiap baris yang diproses.
 func (x *Executor) runBatch(ctx context.Context, job *Job, target *pgx.Conn, e execution) outcome {
 	if _, err := target.Exec(ctx, checkpointTable); err != nil {
-		return outcome{status: "failed", err: err}
+		return failedOutcome(e, err)
 	}
 	// retry melanjutkan checkpoint root yang sama tanpa mengulang batch yang sudah commit
 	p, err := loadProgress(ctx, target, e.RootID)
 	if err != nil {
-		return outcome{status: "failed", err: err}
+		return failedOutcome(e, err)
 	}
 	for {
 		n, last, err := runOneBatch(ctx, target, e, p)
@@ -39,10 +45,10 @@ func (x *Executor) runBatch(ctx context.Context, job *Job, target *pgx.Conn, e e
 				// batch sebelumnya tetap committed, tampilkan sebagai partial supaya bisa di-retry/compensate
 				status = "partial"
 			}
-			return outcome{status: status, err: err, batches: p.batches, rows: p.rows}
+			return outcome{status: status, err: err, batches: p.batches, rows: p.rows, cursor: cursorVal(p.cursor)}
 		}
 		if n == 0 {
-			return outcome{status: "success", batches: p.batches, rows: p.rows}
+			return outcome{status: "success", batches: p.batches, rows: p.rows, cursor: cursorVal(p.cursor)}
 		}
 		p.batches++
 		p.rows += n
@@ -62,8 +68,7 @@ func runOneBatch(ctx context.Context, target *pgx.Conn, e execution, p progress)
 	defer func() {
 		span.SetAttributes(attribute.Int64("batch.rows", n))
 		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, telemetry.Redact(err.Error()))
+			telemetry.RecordError(span, err)
 		}
 		span.End()
 	}()
@@ -143,15 +148,14 @@ type checkpoint struct {
 // Checkpoint batch dihapus di transaksi yang sama, jadi kalau gagal di tengah sisanya bisa dilanjutkan compensate.
 func (x *Executor) runReverseBatch(ctx context.Context, job *Job, target *pgx.Conn, e execution) outcome {
 	if _, err := target.Exec(ctx, checkpointTable); err != nil {
-		return outcome{status: "failed", err: err}
+		return failedOutcome(e, err)
 	}
-	var undone int
-	var rows int64
+	undone, rows, cursor := e.BatchesCommitted, e.RowsProcessed, e.LastCursor
 	for {
 		cp, found, err := lastCheckpoint(ctx, target, e.RootID)
 		if err == nil && !found {
 			// semua batch root sudah dibatalkan
-			return outcome{status: "success", batches: undone, rows: rows}
+			return outcome{status: "success", batches: undone, rows: rows, cursor: cursor}
 		}
 		var n int64
 		if err == nil {
@@ -163,11 +167,12 @@ func (x *Executor) runReverseBatch(ctx context.Context, job *Job, target *pgx.Co
 				// sebagian batch sudah dibatalkan: simpan sisa checkpoint, tampilkan partially_reverted
 				status = "partially_reverted"
 			}
-			return outcome{status: status, err: err, batches: undone, rows: rows}
+			return outcome{status: status, err: err, batches: undone, rows: rows, cursor: cursor}
 		}
 		undone++
 		rows += n
-		if err := job.saveProgress(ctx, e.ID, progress{batches: undone, rows: rows, cursor: &cp.prev}); err != nil {
+		cursor = cp.prev
+		if err := job.saveProgress(ctx, e.ID, progress{batches: undone, rows: rows, cursor: &cursor}); err != nil {
 			slog.WarnContext(ctx, "migration.progress_save_failed", "error", err)
 		}
 	}
@@ -180,8 +185,7 @@ func revertOneBatch(ctx context.Context, target *pgx.Conn, e execution, cp check
 	defer func() {
 		span.SetAttributes(attribute.Int64("batch.rows", n))
 		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, telemetry.Redact(err.Error()))
+			telemetry.RecordError(span, err)
 		}
 		span.End()
 	}()
@@ -192,7 +196,7 @@ func revertOneBatch(ctx context.Context, target *pgx.Conn, e execution, cp check
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 	var prev *string
-	if cp.prev != "" {
+	if cp.batchNo > 1 {
 		prev = &cp.prev
 	}
 	tag, err := tx.Exec(ctx, e.SQL, prev, cp.last)
@@ -219,10 +223,16 @@ func lastCheckpoint(ctx context.Context, target *pgx.Conn, rootID int64) (checkp
 	return cp, err == nil, err
 }
 
-// compensate yang melanjutkan pembatalan sebelumnya tetap partially_reverted walau batch pertamanya gagal
+// compensate/rollback yang melanjutkan pembatalan sebelumnya tetap partially_reverted walau batch pertamanya gagal
 func (x *Executor) continuesRevert(ctx context.Context, e execution) bool {
 	var n int
-	x.Pool.QueryRow(ctx, `SELECT count(*) FROM migration_executions
-		WHERE COALESCE(parent_execution_id, request_id, id) = $1 AND status = 'partially_reverted' AND id <> $2`, e.RootID, e.ID).Scan(&n)
+	err := x.Pool.QueryRow(ctx, `SELECT count(*) FROM migration_executions
+		WHERE COALESCE(parent_execution_id, request_id, id) = $1 AND id <> $2
+			AND (status = 'partially_reverted' OR (COALESCE(request_id, id) = $3 AND batches_committed > 0))`,
+		e.RootID, e.ID, e.ReqID).Scan(&n)
+	if err != nil {
+		slog.WarnContext(ctx, "migration.continues_revert_check_failed", "error", err)
+		return e.Operation == "compensate"
+	}
 	return n > 0
 }

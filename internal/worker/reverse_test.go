@@ -11,7 +11,7 @@ import (
 const batchDownSQL = `UPDATE items SET hits = hits - 1, val = 100 / items.divisor
 WHERE ($1::bigint IS NULL OR id > $1::bigint) AND id <= $2::bigint`
 
-// ajukan rollback/compensate yang membatalkan root, dengan relasi seperti yang diisi Track 2
+// ajukan rollback/compensate yang membatalkan root, dengan relasi seperti yang diisi API
 func enqueueReverse(t *testing.T, pool *pgxpool.Pool, dbID int64, op string, root, reverted int64) int64 {
 	t.Helper()
 	_, id := enqueueSQL(t, pool, dbID, 1, op, batchDownSQL)
@@ -143,5 +143,41 @@ func TestCompensateNormalModeRejected(t *testing.T) {
 	execute(t, pool)
 	if r := execState(t, pool, compID); r.status != "failed" {
 		t.Fatalf("compensate di mode normal harus ditolak: %+v", r)
+	}
+}
+
+func TestReverseBatchAutoRetryPreservesPartiallyReverted(t *testing.T) {
+	pool := platform(t)
+	tp, dbID := target(t, pool)
+	upID := batchUp(t, pool, tp, dbID)
+	ctx := context.Background()
+
+	// Simulasi Attempt 1 rollback sudah revert 1 batch (batch 3) lalu gagal transient dan membuat Attempt 2
+	tp.Exec(ctx, `UPDATE items SET hits = hits - 1 WHERE id > 20`)
+	tp.Exec(ctx, `DELETE FROM _wbd_checkpoints WHERE execution_id = $1 AND batch_no = 3`, upID)
+	tp.Exec(ctx, `UPDATE items SET divisor = 0 WHERE id = 15`) // buat batch 2 gagal non-transient
+
+	rb1 := enqueueReverse(t, pool, dbID, "rollback", upID, upID)
+	pool.Exec(ctx, `UPDATE migration_executions SET status = 'failed', batches_committed = 1, rows_processed = 5, last_cursor = '20' WHERE id = $1`, rb1)
+	var rb2 int64
+	if err := pool.QueryRow(ctx, `INSERT INTO migration_executions
+		(request_id, migration_id, database_id, version, operation, attempt, sql_snapshot, status,
+		 reverted_execution_id, parent_execution_id, batches_committed, rows_processed, last_cursor)
+		SELECT id, migration_id, database_id, version, operation, 2, sql_snapshot, 'pending',
+		 reverted_execution_id, parent_execution_id, 1, 5, '20'
+		FROM migration_executions WHERE id = $1 RETURNING id`, rb1).Scan(&rb2); err != nil {
+		t.Fatal(err)
+	}
+	pool.Exec(ctx, `UPDATE migration_jobs SET execution_id = $2, status = 'pending', run_after = now() WHERE execution_id = $1`, rb1, rb2)
+
+	execute(t, pool)
+	r := execState(t, pool, rb2)
+	if r.status != "partially_reverted" || r.batches != 1 || r.rows != 5 {
+		t.Fatalf("attempt 2 reverse batch harus tetap partially_reverted dengan progres 1/5, dapat %+v", r)
+	}
+	var cursor string
+	pool.QueryRow(ctx, `SELECT last_cursor FROM migration_executions WHERE id = $1`, rb2).Scan(&cursor)
+	if cursor != "20" {
+		t.Fatalf("last_cursor = %q, want 20", cursor)
 	}
 }

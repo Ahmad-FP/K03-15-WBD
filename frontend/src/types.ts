@@ -38,6 +38,19 @@ export interface GroupMember {
   username: string;
 }
 
+export interface ManagedDatabase {
+  id: number;
+  name: string;
+  host_label: string;
+  created_at: string;
+}
+
+export interface DatabaseAccessGrant {
+  group_id: number;
+  group_name: string;
+  access_level: "view_only" | "view_edit";
+}
+
 export interface DatabaseSummary {
   id: number;
   name: string;
@@ -55,14 +68,35 @@ export interface DatabaseDetail {
   }>;
 }
 
+export interface TableColumn {
+  name: string;
+  type: string;
+  nullable: boolean;
+  default: string;
+}
+
+export interface TableConstraint {
+  name: string;
+  type: string;
+  definition: string;
+}
+
+export interface TableIndex {
+  name: string;
+  definition: string;
+  unique: boolean;
+  primary: boolean;
+}
+
 export interface TableViewResponse {
   schema: string;
   table: string;
   kind?: string;
-  columns: Array<string | { name: string; type?: string }>;
-  constraints?: unknown[];
-  indexes?: unknown[];
-  data: Array<Record<string, unknown> | unknown[]>;
+  columns: TableColumn[];
+  constraints: TableConstraint[];
+  indexes: TableIndex[];
+  data: unknown[][];
+  has_next: boolean;
   page: number;
 }
 

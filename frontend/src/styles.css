@@ -55,8 +55,18 @@ body {
 
 .db-picker {
   display: flex;
+  flex-direction: row;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.actions-row select,
+.actions-row input {
+  width: auto;
+  flex: 1 1 200px;
+  max-width: 100%;
 }
 
 .tabs {
@@ -95,6 +105,8 @@ body {
   border: 1px solid #d8dee4;
   border-radius: 8px;
   padding: 16px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .card-header {
@@ -116,7 +128,7 @@ body {
 .form-row-3 {
   display: grid;
   gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
 }
 
 label {
@@ -154,6 +166,11 @@ input[type="checkbox"] {
 .sql-editor {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   overflow-x: auto;
+  resize: vertical;
+}
+
+form + .table-scroll {
+  margin-top: 12px;
 }
 
 /* Scroll internal untuk tabel lebar & blok SQL agar halaman tidak melebar */
@@ -200,8 +217,13 @@ tr.row-active {
 .metrics-grid {
   display: grid;
   gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(170px, 100%), 1fr));
   margin-bottom: 12px;
+}
+
+.metrics-grid > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .subsection,
@@ -261,6 +283,7 @@ button:disabled {
   padding: 10px 14px;
   border-radius: 6px;
   font-size: 0.9rem;
+  overflow-wrap: anywhere;
 }
 
 .alert-error,

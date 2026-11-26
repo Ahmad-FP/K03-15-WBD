@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"time"
@@ -42,6 +43,8 @@ func Middleware(next http.Handler) http.Handler {
 		defer span.End()
 
 		started := time.Now()
+		var reqActor string
+		ctx = context.WithValue(ctx, reqActorKey{}, &reqActor)
 		sw := &statusWriter{ResponseWriter: w}
 		r = r.WithContext(ctx)
 		next.ServeHTTP(sw, r)

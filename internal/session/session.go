@@ -3,10 +3,13 @@ package session
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/Ahmad-FP/K03-15-WBD/internal/httpx"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/telemetry"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -53,6 +56,7 @@ func (s *Store) Start(w http.ResponseWriter, r *http.Request, userID int64) erro
 
 func (s *Store) End(w http.ResponseWriter, r *http.Request) {
 	s.DB.Exec(r.Context(), "DELETE FROM sessions WHERE id = $1", Current(r).ID)
+	w.Header().Del("Set-Cookie")
 	setCookie(w, r, "", -1)
 }
 
@@ -80,6 +84,7 @@ func (s *Store) Require(next http.HandlerFunc) http.Handler {
 			httpx.Error(w, http.StatusUnauthorized, "belum login")
 			return
 		}
+		telemetry.SetRequestActor(r.Context(), sess.Username)
 		next(w, r.WithContext(context.WithValue(r.Context(), key{}, sess)))
 	})
 }
@@ -101,10 +106,20 @@ func (s *Store) resolve(w http.ResponseWriter, r *http.Request) (Session, bool) 
 		return Session{}, false
 	}
 	if rotate && sess.ID == c.Value {
-		s.DB.Exec(r.Context(), "UPDATE sessions SET prev_id = id, prev_until = $3, id = $2, rotated_at = $4, last_seen_at = $4 WHERE id = $1", c.Value, rand.Text(), now.Add(Grace), now)
-		s.DB.QueryRow(r.Context(), "SELECT id FROM sessions WHERE prev_id = $1", c.Value).Scan(&sess.ID)
+		err = s.DB.QueryRow(r.Context(),
+			"UPDATE sessions SET prev_id = id, prev_until = $3, id = $2, rotated_at = $4, last_seen_at = $4 WHERE id = $1 RETURNING id",
+			c.Value, rand.Text(), now.Add(Grace), now).Scan(&sess.ID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = s.DB.QueryRow(r.Context(), "SELECT id FROM sessions WHERE prev_id = $1 AND prev_until > $2", c.Value, now).Scan(&sess.ID)
+		}
+		if err != nil {
+			return Session{}, false
+		}
 	} else {
-		s.DB.Exec(r.Context(), "UPDATE sessions SET last_seen_at = $2 WHERE id = $1", sess.ID, now)
+		tag, err := s.DB.Exec(r.Context(), "UPDATE sessions SET last_seen_at = $2 WHERE id = $1", sess.ID, now)
+		if err != nil || tag.RowsAffected() == 0 {
+			return Session{}, false
+		}
 	}
 	if sess.ID != c.Value {
 		setCookie(w, r, sess.ID, 0)

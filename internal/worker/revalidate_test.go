@@ -157,6 +157,16 @@ func TestRevalidateRollbackAndForward(t *testing.T) {
 	pool.Exec(ctx, `UPDATE migration_executions SET status = 'failed' WHERE id = $1`, fw2)
 	fw1 := addExec(t, pool, dbID, row{migration: m1, version: 1, op: "forward", status: "running"})
 	expect(t, "forward v1 yang masih aktif", verdictFor(t, pool, dbID, fw1), reject)
+
+	// compensate dengan reverted_execution_id != active.id harus ditolak
+	pool.Exec(ctx, `UPDATE migration_executions SET status = 'failed' WHERE id = $1`, fw1)
+	pr := addExec(t, pool, dbID, row{migration: m1, version: 1, op: "rollback", status: "partially_reverted", parent: up1, reverted: up1})
+	staleComp := addExec(t, pool, dbID, row{migration: m1, version: 1, op: "compensate", status: "running", parent: up1, reverted: up2})
+	expect(t, "compensate dengan reverted_execution_id bukan head aktif", verdictFor(t, pool, dbID, staleComp), reject)
+	pool.Exec(ctx, `UPDATE migration_executions SET status = 'failed' WHERE id = $1`, staleComp)
+	goodComp := addExec(t, pool, dbID, row{migration: m1, version: 1, op: "compensate", status: "running", parent: up1, reverted: up1})
+	expect(t, "compensate dengan reverted_execution_id == head aktif", verdictFor(t, pool, dbID, goodComp), proceed)
+	_ = pr
 }
 
 func TestRequeueAndRejectThroughExecutor(t *testing.T) {

@@ -73,9 +73,9 @@ func recoverOne(ctx context.Context, pool *pgxpool.Pool, j Job) (bool, error) {
 		return false, err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	// cek ulang di bawah lock: bisa saja job sudah selesai sebelum kita sempat mengunci
+	// cek ulang di bawah lock: bisa saja job sudah selesai atau lanjut ke attempt berikutnya
 	var status string
-	if err := tx.QueryRow(ctx, `SELECT status FROM migration_jobs WHERE id = $1 FOR UPDATE`, j.ID).Scan(&status); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT status, execution_id FROM migration_jobs WHERE id = $1 FOR UPDATE`, j.ID).Scan(&status, &j.ExecutionID); err != nil {
 		return false, err
 	}
 	if status != "running" {

@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io/fs"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/Ahmad-FP/K03-15-WBD/internal/access"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authentication"
@@ -44,6 +47,7 @@ func newServer(pool *pgxpool.Pool) http.Handler {
 			if !ok {
 				return
 			}
+			r = r.WithContext(telemetry.WithAttrs(r.Context(), slog.Int64("database_id", id)))
 			authorization.RequireDatabaseAccess(pool, id, required, h).ServeHTTP(w, r)
 		})
 	}
@@ -122,23 +126,29 @@ func spaHandler(dir string) http.Handler {
 }
 
 func main() {
-	ctx := context.Background()
+	slog.SetDefault(telemetry.NewLogger(os.Stdout))
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Fatal("DATABASE_URL belum diatur")
+		fatal("DATABASE_URL belum diatur", nil)
 	}
 	poolConfig, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		log.Fatal(err)
+		fatal("DATABASE_URL tidak valid", err)
 	}
 
-	// --- telemetry (Track 3): log JSON ke stdout, span OTel ke stderr, trace setiap query platform ---
-	slog.SetDefault(telemetry.NewLogger(os.Stdout))
 	shutdownTracing, err := telemetry.Init("api", os.Stderr)
 	if err != nil {
-		log.Fatal("gagal menyiapkan tracing: ", err)
+		fatal("gagal menyiapkan tracing", err)
 	}
-	defer shutdownTracing(context.Background())
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdownTracing(shutCtx)
+	}()
 	telemetry.SetActorFunc(func(ctx context.Context) string {
 		if s, ok := session.FromContext(ctx); ok {
 			return s.Username
@@ -146,19 +156,38 @@ func main() {
 		return ""
 	})
 	poolConfig.ConnConfig.Tracer = &telemetry.QueryTracer{DB: "platform"}
-	// --- akhir telemetry ---
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
-		log.Fatal(err)
+		fatal("gagal menyiapkan pool database aplikasi", err)
 	}
 	defer pool.Close()
 
 	if err := pool.Ping(ctx); err != nil {
-		log.Fatal("gagal terhubung ke database aplikasi: ", err)
+		fatal("gagal terhubung ke database aplikasi", err)
 	}
 	if _, err := pool.Exec(ctx, db.Schema); err != nil {
-		log.Fatal("gagal menyiapkan schema: ", err)
+		fatal("gagal menyiapkan schema", err)
 	}
-	log.Fatal(http.ListenAndServe(":8080", telemetry.Middleware(newServer(pool))))
+
+	srv := &http.Server{Addr: ":8080", Handler: telemetry.Middleware(newServer(pool))}
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+	slog.Info("api.start", "addr", srv.Addr)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fatal("server berhenti dengan error", err)
+	}
+}
+
+func fatal(msg string, err error) {
+	if err != nil {
+		slog.Error(msg, "error", err)
+	} else {
+		slog.Error(msg)
+	}
+	os.Exit(1)
 }

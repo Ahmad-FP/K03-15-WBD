@@ -124,6 +124,13 @@ func checkPreconditions(ctx context.Context, pool *pgxpool.Pool, job *Job, e exe
 		statuses := "'partial'"
 		if e.Operation == "compensate" {
 			statuses = "'partial', 'partially_reverted'"
+			var reverted *int64
+			if err := pool.QueryRow(ctx, `SELECT reverted_execution_id FROM migration_executions WHERE id = $1`, e.ID).Scan(&reverted); err != nil {
+				return decision{}, err
+			}
+			if reverted != nil && (e.Version != head.version || *reverted != head.activeID) {
+				return refuse("eksekusi yang mau dikompensasi bukan eksekusi aktif v%d", head.version), nil
+			}
 		}
 		var n int
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM (`+unresolvedRows+`) u JOIN migration_executions p ON p.id = u.id

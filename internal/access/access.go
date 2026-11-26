@@ -6,7 +6,6 @@ import (
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authorization"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/httpx"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -26,22 +25,10 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `SELECT g.id, g.name, a.access_level
+	httpx.WriteList[Grant](w, r, h.DB, "gagal mengambil akses database",
+		`SELECT g.id, g.name, a.access_level
 		FROM group_database_access a JOIN platform_groups g ON g.id = a.group_id
 		WHERE a.database_id = $1 ORDER BY g.name`, dbID)
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "gagal mengambil akses database")
-		return
-	}
-	out, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Grant])
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "gagal membaca akses database")
-		return
-	}
-	if out == nil {
-		out = []Grant{}
-	}
-	httpx.JSON(w, http.StatusOK, out)
 }
 
 func (h *Handler) Set(w http.ResponseWriter, r *http.Request) {
@@ -88,13 +75,8 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	tag, err := h.DB.Exec(r.Context(), `DELETE FROM group_database_access WHERE group_id = $1 AND database_id = $2`, groupID, dbID)
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "gagal mencabut akses")
-		return
-	}
-	if tag.RowsAffected() == 0 {
-		httpx.Error(w, http.StatusNotFound, "akses tidak ditemukan")
+	if !httpx.ExecFound(w, r, h.DB, "akses tidak ditemukan", "gagal mencabut akses",
+		`DELETE FROM group_database_access WHERE group_id = $1 AND database_id = $2`, groupID, dbID) {
 		return
 	}
 	h.Sessions.RevokeGroup(r.Context(), groupID)

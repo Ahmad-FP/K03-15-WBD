@@ -37,39 +37,28 @@ type MigrationDetail struct {
 	CanForward  bool `json:"can_forward"`
 }
 
-const selectMigration = `SELECT m.id, m.version, m.name, m.sql, m.sql_down, m.irreversible_reason,
+const selectMigrationCols = `m.id, m.version, m.name, m.sql, m.sql_down, m.irreversible_reason,
 		m.batch_column, m.batch_size,
 		EXISTS (SELECT 1 FROM migration_executions e WHERE e.migration_id = m.id),
-		COALESCE(c.username, ''), m.created_at, m.updated_at
+		COALESCE(c.username, ''), m.created_at, m.updated_at`
+
+const selectMigration = `SELECT ` + selectMigrationCols + `
 	FROM migrations m
 	LEFT JOIN users c ON c.id = m.created_by`
 
 func List(ctx context.Context, pool *pgxpool.Pool, dbID int64) ([]Migration, error) {
-	rows, err := pool.Query(ctx, selectMigration+` WHERE m.database_id = $1 ORDER BY m.version DESC`, dbID)
-	if err != nil {
-		return nil, err
-	}
-	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Migration])
-	if list == nil {
-		list = []Migration{}
-	}
-	return list, err
-}
-
-func Get(ctx context.Context, q queryer, dbID, id int64) (Migration, error) {
-	rows, err := q.Query(ctx, selectMigration+` WHERE m.database_id = $1 AND m.id = $2`, dbID, id)
-	if err != nil {
-		return Migration{}, err
-	}
-	m, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[Migration])
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Migration{}, ErrNotFound
-	}
-	return m, err
+	return httpx.Collect[Migration](ctx, pool, selectMigration+` WHERE m.database_id = $1 ORDER BY m.version DESC`, dbID)
 }
 
 func GetDetail(ctx context.Context, pool *pgxpool.Pool, dbID, id int64) (MigrationDetail, error) {
-	m, err := Get(ctx, pool, dbID, id)
+	rows, err := pool.Query(ctx, selectMigration+` WHERE m.database_id = $1 AND m.id = $2`, dbID, id)
+	if err != nil {
+		return MigrationDetail{}, err
+	}
+	m, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[Migration])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return MigrationDetail{}, ErrNotFound
+	}
 	if err != nil {
 		return MigrationDetail{}, err
 	}
@@ -85,26 +74,22 @@ func Create(ctx context.Context, pool *pgxpool.Pool, dbID, userID int64, in Inpu
 	if err != nil {
 		return Migration{}, err
 	}
-	tx, err := beginDatabaseTx(ctx, pool, dbID)
-	if err != nil {
-		return Migration{}, err
-	}
-	defer tx.Rollback(ctx)
-
-	var id int64
-	err = tx.QueryRow(ctx, `INSERT INTO migrations
-			(database_id, version, name, sql, sql_down, irreversible_reason, batch_column, batch_size, created_by)
-		VALUES ($1, (SELECT COALESCE(MAX(version), 0) + 1 FROM migrations WHERE database_id = $1), $2, $3, $4, $5, $6, $7, $8)
-		RETURNING id`,
-		dbID, in.Name, in.SQLUp, in.SQLDown, in.IrreversibleReason, in.BatchColumn, in.BatchSize, userID).Scan(&id)
-	if err != nil {
-		return Migration{}, err
-	}
-	m, err := Get(ctx, tx, dbID, id)
-	if err != nil {
-		return Migration{}, err
-	}
-	return m, tx.Commit(ctx)
+	return withDatabaseTx(ctx, pool, dbID, func(tx pgx.Tx) (Migration, error) {
+		rows, err := tx.Query(ctx, `WITH m AS (
+				INSERT INTO migrations
+					(database_id, version, name, sql, sql_down, irreversible_reason, batch_column, batch_size, created_by)
+				VALUES ($1, (SELECT COALESCE(MAX(version), 0) + 1 FROM migrations WHERE database_id = $1), $2, $3, $4, $5, $6, $7, $8)
+				RETURNING *
+			)
+			SELECT m.id, m.version, m.name, m.sql, m.sql_down, m.irreversible_reason,
+				m.batch_column, m.batch_size, FALSE, COALESCE(c.username, ''), m.created_at, m.updated_at
+			FROM m LEFT JOIN users c ON c.id = m.created_by`,
+			dbID, in.Name, in.SQLUp, in.SQLDown, in.IrreversibleReason, in.BatchColumn, in.BatchSize, userID)
+		if err != nil {
+			return Migration{}, err
+		}
+		return pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[Migration])
+	})
 }
 
 func Update(ctx context.Context, pool *pgxpool.Pool, dbID, id int64, in Input) (Migration, error) {
@@ -116,28 +101,32 @@ func Update(ctx context.Context, pool *pgxpool.Pool, dbID, id int64, in Input) (
 	if err != nil {
 		return Migration{}, err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.WithoutCancel(ctx))
 
 	var locked int64
-	err = tx.QueryRow(ctx, `SELECT id FROM migrations WHERE database_id = $1 AND id = $2 FOR UPDATE`, dbID, id).Scan(&locked)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if err := tx.QueryRow(ctx, `SELECT id FROM migrations WHERE database_id = $1 AND id = $2 FOR UPDATE`, dbID, id).Scan(&locked); errors.Is(err, pgx.ErrNoRows) {
 		return Migration{}, ErrNotFound
-	}
-	if err != nil {
+	} else if err != nil {
 		return Migration{}, err
 	}
-	tag, err := tx.Exec(ctx, `UPDATE migrations
-		SET name = $3, sql = $4, sql_down = $5, irreversible_reason = $6, batch_column = $7, batch_size = $8, updated_at = now()
-		WHERE database_id = $1 AND id = $2
-			AND NOT EXISTS (SELECT 1 FROM migration_executions WHERE migration_id = $2)`,
+	rows, err := tx.Query(ctx, `WITH m AS (
+			UPDATE migrations
+			SET name = $3, sql = $4, sql_down = $5, irreversible_reason = $6, batch_column = $7, batch_size = $8, updated_at = now()
+			WHERE database_id = $1 AND id = $2
+				AND NOT EXISTS (SELECT 1 FROM migration_executions WHERE migration_id = $2)
+			RETURNING *
+		)
+		SELECT m.id, m.version, m.name, m.sql, m.sql_down, m.irreversible_reason,
+			m.batch_column, m.batch_size, FALSE, COALESCE(c.username, ''), m.created_at, m.updated_at
+		FROM m LEFT JOIN users c ON c.id = m.created_by`,
 		dbID, id, in.Name, in.SQLUp, in.SQLDown, in.IrreversibleReason, in.BatchColumn, in.BatchSize)
 	if err != nil {
 		return Migration{}, err
 	}
-	if tag.RowsAffected() == 0 {
+	m, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[Migration])
+	if errors.Is(err, pgx.ErrNoRows) {
 		return Migration{}, ErrLocked
 	}
-	m, err := Get(ctx, tx, dbID, id)
 	if err != nil {
 		return Migration{}, err
 	}

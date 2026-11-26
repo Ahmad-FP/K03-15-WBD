@@ -1,6 +1,7 @@
 package viewer
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -23,7 +24,8 @@ type databaseItem struct {
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.DB.Query(r.Context(), `SELECT d.id, d.name, d.host_label,
+	httpx.WriteList[databaseItem](w, r, h.DB, "gagal mengambil daftar database",
+		`SELECT d.id, d.name, d.host_label,
 			CASE WHEN bool_or(a.access_level = 'view_edit') THEN 'view_edit' ELSE 'view_only' END
 		FROM managed_databases d
 		JOIN group_database_access a ON a.database_id = d.id
@@ -31,19 +33,6 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		WHERE gm.user_id = $1
 		GROUP BY d.id
 		ORDER BY d.name, d.id`, session.Current(r).UserID)
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "gagal mengambil daftar database")
-		return
-	}
-	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[databaseItem])
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "gagal membaca daftar database")
-		return
-	}
-	if list == nil {
-		list = []databaseItem{}
-	}
-	httpx.JSON(w, http.StatusOK, list)
 }
 
 func (h *Handler) Overview(w http.ResponseWriter, r *http.Request) {
@@ -79,49 +68,16 @@ func (h *Handler) Table(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer done()
-	ctx := r.Context()
-	schema, name := r.PathValue("schema"), r.PathValue("table")
-	oid, kind, err := findTable(ctx, tx, schema, name)
+	detail, err := loadTable(r.Context(), tx, r.PathValue("schema"), r.PathValue("table"), parsePage(r.URL.Query().Get("page")))
 	if errors.Is(err, errNoTable) {
 		httpx.Error(w, http.StatusNotFound, err.Error())
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusBadGateway, "gagal membaca table")
-		return
-	}
-	cols, err := listColumns(ctx, tx, oid)
-	if err != nil {
-		httpx.Error(w, http.StatusBadGateway, "gagal membaca kolom")
-		return
-	}
-	cons, err := listConstraints(ctx, tx, oid)
-	if err != nil {
-		httpx.Error(w, http.StatusBadGateway, "gagal membaca constraint")
-		return
-	}
-	idx, err := listIndexes(ctx, tx, oid)
-	if err != nil {
-		httpx.Error(w, http.StatusBadGateway, "gagal membaca index")
-		return
-	}
-	num := parsePage(r.URL.Query().Get("page"))
-	data, hasNext, err := readRows(ctx, tx, schema, name, oid, num)
-	if err != nil {
 		httpx.Error(w, http.StatusBadGateway, "gagal membaca data table")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, struct {
-		Schema      string       `json:"schema"`
-		Table       string       `json:"table"`
-		Kind        string       `json:"kind"`
-		Columns     []column     `json:"columns"`
-		Constraints []constraint `json:"constraints"`
-		Indexes     []index      `json:"indexes"`
-		Data        [][]any      `json:"data"`
-		HasNext     bool         `json:"has_next"`
-		Page        int          `json:"page"`
-	}{schema, name, kind, cols, cons, idx, data, hasNext, num})
+	httpx.JSON(w, http.StatusOK, detail)
 }
 
 func (h *Handler) readOnly(w http.ResponseWriter, r *http.Request, id int64) (pgx.Tx, func(), bool) {
@@ -137,13 +93,14 @@ func (h *Handler) readOnly(w http.ResponseWriter, r *http.Request, id int64) (pg
 		_, err = tx.Exec(ctx, "SET LOCAL statement_timeout = '10s'")
 	}
 	if err != nil {
-		conn.Close(ctx)
+		_ = conn.Close(context.WithoutCancel(ctx))
 		status, msg := db.ConnectStatus(db.ErrUnreachable)
 		httpx.Error(w, status, msg)
 		return nil, nil, false
 	}
 	return tx, func() {
-		tx.Rollback(ctx)
-		conn.Close(ctx)
+		bg := context.WithoutCancel(ctx)
+		_ = tx.Rollback(bg)
+		_ = conn.Close(bg)
 	}, true
 }

@@ -2,10 +2,12 @@ package telemetry
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -61,12 +63,42 @@ func traceIDs(ctx context.Context) (traceID, spanID string) {
 	return sc.TraceID().String(), sc.SpanID().String()
 }
 
+// catat error yang sudah disamarkan ke span OTel agar rahasia tidak bocor
+func RecordError(span trace.Span, err error) {
+	if err == nil {
+		return
+	}
+	msg := Redact(err.Error())
+	span.RecordError(errors.New(msg))
+	span.SetStatus(codes.Error, msg)
+}
+
 type Handler struct{ slog.Handler }
 
 func (h Handler) Handle(ctx context.Context, r slog.Record) error {
+	var extra []slog.Attr
 	if tid, sid := traceIDs(ctx); tid != "" {
+		extra = append(extra, slog.String("trace_id", tid), slog.String("span_id", sid))
+	}
+	if a := actor(ctx); a != "" {
+		extra = append(extra, slog.String("actor", a))
+	}
+	if attrs, ok := ctx.Value(attrsKey{}).([]slog.Attr); ok {
+		extra = append(extra, attrs...)
+	}
+	if len(extra) > 0 {
+		seen := make(map[string]bool, r.NumAttrs())
+		r.Attrs(func(a slog.Attr) bool {
+			seen[a.Key] = true
+			return true
+		})
 		r = r.Clone()
-		r.AddAttrs(slog.String("trace_id", tid), slog.String("span_id", sid))
+		for _, a := range extra {
+			if !seen[a.Key] {
+				seen[a.Key] = true
+				r.AddAttrs(a)
+			}
+		}
 	}
 	return h.Handler.Handle(ctx, r)
 }

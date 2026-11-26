@@ -5,22 +5,23 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
 const maxParamLen = 100
 
 type (
-	actorKey struct{}
-	attrsKey struct{}
-	queryKey struct{}
+	actorKey    struct{}
+	reqActorKey struct{}
+	attrsKey    struct{}
+	queryKey    struct{}
 )
 
 type queryStart struct {
@@ -46,9 +47,19 @@ func WithAttrs(ctx context.Context, attrs ...slog.Attr) context.Context {
 	return context.WithValue(ctx, attrsKey{}, append(append([]slog.Attr{}, prev...), attrs...))
 }
 
+// isi actor untuk request HTTP yang berjalan di dalam Middleware
+func SetRequestActor(ctx context.Context, name string) {
+	if slot, ok := ctx.Value(reqActorKey{}).(*string); ok && name != "" {
+		*slot = name
+	}
+}
+
 func actor(ctx context.Context) string {
 	if a, ok := ctx.Value(actorKey{}).(string); ok {
 		return a
+	}
+	if slot, ok := ctx.Value(reqActorKey{}).(*string); ok && *slot != "" {
+		return *slot
 	}
 	if actorFunc != nil {
 		return actorFunc(ctx)
@@ -99,8 +110,7 @@ func (t *QueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.T
 			attrs = append(attrs, slog.String("sqlstate", pgErr.Code))
 			q.span.SetAttributes(attribute.String("db.sqlstate", pgErr.Code))
 		}
-		q.span.RecordError(data.Err)
-		q.span.SetStatus(codes.Error, Redact(data.Err.Error()))
+		RecordError(q.span, data.Err)
 	}
 	attrs = append(attrs, slog.String("status", status))
 	q.span.SetAttributes(attribute.Int64("db.rows", data.CommandTag.RowsAffected()))
@@ -109,14 +119,7 @@ func (t *QueryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.T
 }
 
 func (t *QueryTracer) common(ctx context.Context, event, sql string) []slog.Attr {
-	attrs := []slog.Attr{slog.String("event", event), slog.String("db", t.DB)}
-	if a := actor(ctx); a != "" {
-		attrs = append(attrs, slog.String("actor", a))
-	}
-	if extra, ok := ctx.Value(attrsKey{}).([]slog.Attr); ok {
-		attrs = append(attrs, extra...)
-	}
-	return append(attrs, slog.String("query", sql))
+	return []slog.Attr{slog.String("event", event), slog.String("db", t.DB), slog.String("query", sql)}
 }
 
 // commit/rollback/begin dicatat sebagai event tersendiri, sisanya sql.query
@@ -144,6 +147,13 @@ func params(sql string, args []any) []string {
 	hide := secretKey(sql)
 	out := make([]string, len(args))
 	for i, a := range args {
+		if rv := reflect.ValueOf(a); rv.IsValid() && rv.Kind() == reflect.Pointer {
+			if rv.IsNil() {
+				out[i] = "NULL"
+				continue
+			}
+			a = rv.Elem().Interface()
+		}
 		switch v := a.(type) {
 		case nil:
 			out[i] = "NULL"

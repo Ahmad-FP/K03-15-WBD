@@ -6,6 +6,7 @@ import (
 
 	"github.com/Ahmad-FP/K03-15-WBD/internal/httpx"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/telemetry"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -46,6 +47,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "gagal membuat session")
 		return
 	}
+	telemetry.SetRequestActor(r.Context(), u.Username)
 	httpx.JSON(w, http.StatusOK, u)
 }
 
