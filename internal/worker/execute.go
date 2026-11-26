@@ -31,6 +31,7 @@ var errTxEnded = errors.New("SQL migration menutup transaction sendiri, perubaha
 type execution struct {
 	ID          int64
 	ReqID       int64 // COALESCE(request_id, id): id pengajuan pertama, stabil lintas retry
+	RootID      int64 // COALESCE(parent_execution_id, request_id, id): pemilik checkpoint batch
 	MigrationID int64
 	Version     int
 	Operation   string
@@ -91,10 +92,14 @@ func (x *Executor) run(ctx context.Context, job *Job, e execution) outcome {
 		return outcome{status: "failed", err: err}
 	}
 	defer target.Close(context.WithoutCancel(ctx))
-	if e.BatchSize > 0 {
-		return outcome{status: "failed", err: errors.New("mode batch belum didukung worker")}
+	if e.BatchSize == 0 {
+		return runNormal(ctx, target, e)
 	}
-	return runNormal(ctx, target, e)
+	switch e.Operation {
+	case "up", "forward", "retry":
+		return x.runBatch(ctx, job, target, e)
+	}
+	return outcome{status: "failed", err: errors.New("operasi " + e.Operation + " mode batch belum didukung worker")}
 }
 
 // mode normal: seluruh SQL dalam satu transaksi + checkpoint batch 1 sebagai bukti commit
@@ -137,13 +142,13 @@ func runNormal(ctx context.Context, target *pgx.Conn, e execution) outcome {
 
 func loadExecution(ctx context.Context, pool *pgxpool.Pool, id int64) (execution, error) {
 	var e execution
-	err := pool.QueryRow(ctx, `SELECT e.id, COALESCE(e.request_id, e.id), e.migration_id, e.version, e.operation, e.attempt,
+	err := pool.QueryRow(ctx, `SELECT e.id, COALESCE(e.request_id, e.id), COALESCE(e.parent_execution_id, e.request_id, e.id), e.migration_id, e.version, e.operation, e.attempt,
 			e.sql_snapshot, COALESCE(u.username, ''), m.batch_size, j.max_attempts
 		FROM migration_executions e
 		JOIN migrations m ON m.id = e.migration_id
 		JOIN migration_jobs j ON j.execution_id = e.id
 		LEFT JOIN users u ON u.id = e.requested_by
-		WHERE e.id = $1`, id).Scan(&e.ID, &e.ReqID, &e.MigrationID, &e.Version, &e.Operation, &e.Attempt,
+		WHERE e.id = $1`, id).Scan(&e.ID, &e.ReqID, &e.RootID, &e.MigrationID, &e.Version, &e.Operation, &e.Attempt,
 		&e.SQL, &e.Actor, &e.BatchSize, &e.MaxAttempts)
 	return e, err
 }
