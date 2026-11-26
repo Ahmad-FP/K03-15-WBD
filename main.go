@@ -2,17 +2,18 @@ package main
 
 import (
 	"context"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"strings"
 
 	"github.com/Ahmad-FP/K03-15-WBD/internal/access"
-	"github.com/Ahmad-FP/K03-15-WBD/internal/admin"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authentication"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authorization"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/db"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/groups"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/httpx"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/migration"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/users"
@@ -29,53 +30,31 @@ func newServer(pool *pgxpool.Pool) http.Handler {
 	accessHandler := &access.Handler{DB: pool, Sessions: sessions}
 	viewerHandler := &viewer.Handler{DB: pool}
 	migrationHandler := &migration.Handler{DB: pool}
-	adminPages := &admin.Handler{DB: pool}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /login", authHandler.LoginPage)
-	mux.HandleFunc("POST /login", authHandler.Login)
-	mux.Handle("POST /logout", sessions.Require(authHandler.Logout))
-	mux.Handle("GET /{$}", sessions.Require(authHandler.Home))
 
-	// Semua route admin harus melewati autentikasi session dan pemeriksaan role admin.
 	admin := func(h http.HandlerFunc) http.Handler {
-		protected := authorization.RequirePlatformAdmin(h)
-		return sessions.Require(func(w http.ResponseWriter, r *http.Request) {
-			protected.ServeHTTP(w, r)
-		})
+		return sessions.Require(authorization.RequirePlatformAdmin(h).ServeHTTP)
 	}
-
-	// cek session dulu, baru cek akses group ke database {id} di path
 	dbAccess := func(required authorization.Level, h http.HandlerFunc) http.Handler {
 		return sessions.Require(func(w http.ResponseWriter, r *http.Request) {
-			id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-			if err != nil || id <= 0 {
-				http.Error(w, "id tidak valid", http.StatusBadRequest)
+			id, ok := httpx.ID(w, r, "id")
+			if !ok {
 				return
 			}
 			authorization.RequireDatabaseAccess(pool, id, required, h).ServeHTTP(w, r)
 		})
 	}
 
-	mux.Handle("GET /databases", sessions.Require(viewerHandler.List))
-	mux.Handle("GET /databases/{id}", dbAccess(authorization.ViewOnly, viewerHandler.Overview))
-	mux.Handle("GET /databases/{id}/tables/{schema}/{table}", dbAccess(authorization.ViewOnly, viewerHandler.Table))
+	mux.HandleFunc("POST /api/auth/login", authHandler.Login)
+	mux.Handle("POST /api/auth/logout", sessions.Require(authHandler.Logout))
+	mux.Handle("GET /api/auth/me", sessions.Require(authHandler.Me))
 
-	mux.Handle("GET /databases/{id}/migrations", dbAccess(authorization.ViewOnly, migrationHandler.List))
-	mux.Handle("GET /databases/{id}/migrations/{mid}", dbAccess(authorization.ViewOnly, migrationHandler.Show))
-	mux.Handle("GET /databases/{id}/migrations/new", dbAccess(authorization.ViewEdit, migrationHandler.New))
-	mux.Handle("POST /databases/{id}/migrations", dbAccess(authorization.ViewEdit, migrationHandler.Create))
-	mux.Handle("POST /databases/{id}/migrations/{mid}", dbAccess(authorization.ViewEdit, migrationHandler.Update))
-	mux.Handle("POST /databases/{id}/migrations/{mid}/delete", dbAccess(authorization.ViewEdit, migrationHandler.Delete))
-	mux.Handle("POST /databases/{id}/migrations/{mid}/run", dbAccess(authorization.ViewEdit, migrationHandler.Run))
-
-	mux.Handle("GET /admin/groups", admin(adminPages.Groups))
-	mux.Handle("GET /admin/databases", admin(adminPages.Databases))
-	mux.Handle("GET /admin/users", admin(userHandler.List))
-	mux.Handle("POST /admin/users", admin(userHandler.Create))
-	mux.Handle("POST /admin/users/{id}/password", admin(userHandler.SetPassword))
-	mux.Handle("POST /admin/users/{id}/admin", admin(userHandler.SetAdmin))
-	mux.Handle("POST /admin/users/{id}/delete", admin(userHandler.Delete))
+	mux.Handle("GET /api/users", admin(userHandler.List))
+	mux.Handle("POST /api/users", admin(userHandler.Create))
+	mux.Handle("PUT /api/users/{id}/password", admin(userHandler.SetPassword))
+	mux.Handle("PUT /api/users/{id}/admin", admin(userHandler.SetAdmin))
+	mux.Handle("DELETE /api/users/{id}", admin(userHandler.Delete))
 
 	mux.Handle("GET /api/groups", admin(groupHandler.List))
 	mux.Handle("POST /api/groups", admin(groupHandler.Create))
@@ -95,7 +74,49 @@ func newServer(pool *pgxpool.Pool) http.Handler {
 	mux.Handle("PUT /api/db/{id}/access/{groupId}", admin(accessHandler.Set))
 	mux.Handle("DELETE /api/db/{id}/access/{groupId}", admin(accessHandler.Delete))
 
+	mux.Handle("GET /api/databases", sessions.Require(viewerHandler.List))
+	mux.Handle("GET /api/databases/{id}", dbAccess(authorization.ViewOnly, viewerHandler.Overview))
+	mux.Handle("GET /api/databases/{id}/tables/{schema}/{table}", dbAccess(authorization.ViewOnly, viewerHandler.Table))
+
+	mux.Handle("GET /api/databases/{id}/migrations", dbAccess(authorization.ViewOnly, migrationHandler.List))
+	mux.Handle("POST /api/databases/{id}/migrations", dbAccess(authorization.ViewEdit, migrationHandler.Create))
+	mux.Handle("GET /api/databases/{id}/migrations/{mid}", dbAccess(authorization.ViewOnly, migrationHandler.Show))
+	mux.Handle("PUT /api/databases/{id}/migrations/{mid}", dbAccess(authorization.ViewEdit, migrationHandler.Update))
+	mux.Handle("DELETE /api/databases/{id}/migrations/{mid}", dbAccess(authorization.ViewEdit, migrationHandler.Delete))
+
+	mux.Handle("GET /api/databases/{id}/executions", dbAccess(authorization.ViewOnly, migrationHandler.ListExecutions))
+	mux.Handle("GET /api/databases/{id}/executions/{eid}", dbAccess(authorization.ViewOnly, migrationHandler.ShowExecution))
+	mux.Handle("POST /api/databases/{id}/migrations/{mid}/submit", dbAccess(authorization.ViewEdit, migrationHandler.Submit))
+	mux.Handle("POST /api/databases/{id}/migrations/{mid}/rollback", dbAccess(authorization.ViewEdit, migrationHandler.Rollback))
+	mux.Handle("POST /api/databases/{id}/executions/{eid}/retry", dbAccess(authorization.ViewEdit, migrationHandler.Retry))
+	mux.Handle("POST /api/databases/{id}/executions/{eid}/compensate", dbAccess(authorization.ViewEdit, migrationHandler.Compensate))
+	mux.Handle("POST /api/databases/{id}/executions/{eid}/approve", dbAccess(authorization.ViewOnly, migrationHandler.Approve))
+	mux.Handle("POST /api/databases/{id}/executions/{eid}/cancel", dbAccess(authorization.ViewEdit, migrationHandler.Cancel))
+	mux.Handle("POST /api/databases/{id}/executions/{eid}/enqueue", dbAccess(authorization.ViewEdit, migrationHandler.Enqueue))
+
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		httpx.Error(w, http.StatusNotFound, "endpoint tidak ditemukan")
+	})
+	mux.Handle("/", spaHandler("frontend/dist"))
+
 	return http.NewCrossOriginProtection().Handler(mux)
+}
+
+func spaHandler(dir string) http.Handler {
+	fsys := os.DirFS(dir)
+	files := http.FileServerFS(fsys)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/")
+		if p != "" {
+			if info, err := fs.Stat(fsys, p); err != nil || info.IsDir() {
+				r2 := r.Clone(r.Context())
+				r2.URL.Path = "/"
+				files.ServeHTTP(w, r2)
+				return
+			}
+		}
+		files.ServeHTTP(w, r)
+	})
 }
 
 func main() {

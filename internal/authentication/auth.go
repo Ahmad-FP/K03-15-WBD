@@ -1,46 +1,60 @@
 package authentication
 
 import (
-	"embed"
-	"html/template"
+	"errors"
 	"net/http"
 
+	"github.com/Ahmad-FP/K03-15-WBD/internal/httpx"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-//go:embed *.html
-var files embed.FS
-
-var tmpl = template.Must(template.ParseFS(files, "*.html"))
 
 type Handler struct {
 	DB       *pgxpool.Pool
 	Sessions *session.Store
 }
 
-func (h *Handler) LoginPage(w http.ResponseWriter, r *http.Request) {
-	tmpl.ExecuteTemplate(w, "login.html", nil)
+type userResponse struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+	IsAdmin  bool   `json:"is_admin"`
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
-	var id int64
-	var hash string
-	h.DB.QueryRow(r.Context(), "SELECT id, password_hash FROM users WHERE username = $1", r.FormValue("username")).Scan(&id, &hash)
-	if !Check(hash, r.FormValue("password")) {
-		w.WriteHeader(http.StatusUnauthorized)
-		tmpl.ExecuteTemplate(w, "login.html", "Username atau password salah")
+	var p struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if !httpx.Decode(w, r, &p) {
 		return
 	}
-	h.Sessions.Start(w, r, id)
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	var u userResponse
+	var hash string
+	err := h.DB.QueryRow(r.Context(),
+		`SELECT id, username, password_hash, is_admin FROM users WHERE username = $1`, p.Username).
+		Scan(&u.ID, &u.Username, &hash, &u.IsAdmin)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		httpx.Error(w, http.StatusInternalServerError, "gagal memeriksa akun")
+		return
+	}
+	if err != nil || !Check(hash, p.Password) {
+		httpx.Error(w, http.StatusUnauthorized, "username atau password salah")
+		return
+	}
+	if err := h.Sessions.Start(w, r, u.ID); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "gagal membuat session")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, u)
 }
 
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	h.Sessions.End(w, r)
-	http.Redirect(w, r, "/login", http.StatusSeeOther)
+	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *Handler) Home(w http.ResponseWriter, r *http.Request) {
-	tmpl.ExecuteTemplate(w, "home.html", session.Current(r))
+func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
+	s := session.Current(r)
+	httpx.JSON(w, http.StatusOK, userResponse{ID: s.UserID, Username: s.Username, IsAdmin: s.Admin})
 }

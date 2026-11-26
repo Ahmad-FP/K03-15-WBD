@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -26,7 +26,10 @@ func testServer(t *testing.T) (http.Handler, *pgxpool.Pool) {
 	}
 	schema := "test_" + strings.ToLower(rand.Text())
 	cfg.ConnConfig.RuntimeParams["search_path"] = schema
-	pool, _ := pgxpool.NewWithConfig(ctx, cfg)
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schema+";"+db.Schema); err != nil {
 		t.Fatal(err)
 	}
@@ -37,20 +40,14 @@ func testServer(t *testing.T) (http.Handler, *pgxpool.Pool) {
 	return newServer(pool), pool
 }
 
-func do(h http.Handler, method, path, sid string, form url.Values) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(method, path, strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+func doJSON(h http.Handler, method, path, sid, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if sid != "" {
 		req.AddCookie(&http.Cookie{Name: session.CookieName, Value: sid})
 	}
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	return rec
-}
-
-func doJSON(h http.Handler, method, path, sid, body string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(method, path, strings.NewReader(body))
-	req.AddCookie(&http.Cookie{Name: session.CookieName, Value: sid})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -66,50 +63,73 @@ func cookie(rec *httptest.ResponseRecorder) *http.Cookie {
 }
 
 func login(t *testing.T, h http.Handler, username, password string) string {
-	rec := do(h, "POST", "/login", "", url.Values{"username": {username}, "password": {password}})
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("login %s: status %d", username, rec.Code)
+	t.Helper()
+	b, _ := json.Marshal(map[string]string{"username": username, "password": password})
+	rec := doJSON(h, "POST", "/api/auth/login", "", string(b))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login %s: status %d %s", username, rec.Code, rec.Body)
 	}
-	return cookie(rec).Value
+	c := cookie(rec)
+	if c == nil {
+		t.Fatalf("login %s: missing session cookie", username)
+	}
+	return c.Value
 }
 
 func loggedIn(h http.Handler, sid string) bool {
-	return do(h, "GET", "/", sid, nil).Code == http.StatusOK
+	return doJSON(h, "GET", "/api/auth/me", sid, "").Code == http.StatusOK
 }
 
 func addUser(t *testing.T, pool *pgxpool.Pool, username, password string) int64 {
+	t.Helper()
 	var id int64
-	err := pool.QueryRow(context.Background(), "INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id", username, authentication.Hash(password)).Scan(&id)
+	err := pool.QueryRow(context.Background(), "INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id",
+		username, authentication.Hash(password)).Scan(&id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return id
 }
 
+func assertJSONError(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int) {
+	t.Helper()
+	if rec.Code != wantStatus {
+		t.Errorf("status %d, want %d (body: %s)", rec.Code, wantStatus, rec.Body)
+	}
+	var e struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil || e.Error == "" {
+		t.Errorf("expected JSON error body, got %q", rec.Body.String())
+	}
+}
+
 func TestLogin(t *testing.T) {
 	h, _ := testServer(t)
 
-	rec := do(h, "POST", "/login", "", url.Values{"username": {"admin"}, "password": {"admin"}})
+	rec := doJSON(h, "POST", "/api/auth/login", "", `{"username":"admin","password":"admin"}`)
 	c := cookie(rec)
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/" || c == nil {
-		t.Fatalf("login: status %d, location %q, cookie %v", rec.Code, rec.Header().Get("Location"), c)
+	if rec.Code != http.StatusOK || c == nil {
+		t.Fatalf("login: status %d, cookie %v, body %s", rec.Code, c, rec.Body)
 	}
 	if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode {
 		t.Error("session cookie not HttpOnly/SameSite")
 	}
 
-	home := do(h, "GET", "/", c.Value, nil)
-	if home.Code != http.StatusOK || !strings.Contains(home.Body.String(), "admin") {
-		t.Fatalf("home: status %d", home.Code)
+	me := doJSON(h, "GET", "/api/auth/me", c.Value, "")
+	if me.Code != http.StatusOK || !strings.Contains(me.Body.String(), `"username":"admin"`) || !strings.Contains(me.Body.String(), `"is_admin":true`) {
+		t.Fatalf("me: status %d body %s", me.Code, me.Body)
 	}
-	if strings.Contains(home.Body.String(), c.Value) {
+	if strings.Contains(me.Body.String(), c.Value) {
 		t.Error("session id in response body")
 	}
 
 	for _, creds := range [][2]string{{"admin", "pw-keliru"}, {"tidakada", "admin"}} {
-		rec := do(h, "POST", "/login", "", url.Values{"username": {creds[0]}, "password": {creds[1]}})
-		if rec.Code != http.StatusUnauthorized || cookie(rec) != nil {
-			t.Errorf("login %v: status %d, cookie %v", creds, rec.Code, cookie(rec))
+		b, _ := json.Marshal(map[string]string{"username": creds[0], "password": creds[1]})
+		rec := doJSON(h, "POST", "/api/auth/login", "", string(b))
+		assertJSONError(t, rec, http.StatusUnauthorized)
+		if cookie(rec) != nil {
+			t.Errorf("login %v issued cookie", creds)
 		}
 		if strings.Contains(rec.Body.String(), creds[1]) {
 			t.Errorf("login %v: password in response", creds)
@@ -121,13 +141,10 @@ func TestProtectedNeedsSession(t *testing.T) {
 	h, pool := testServer(t)
 
 	for _, sid := range []string{"", "tebakan"} {
-		rec := do(h, "GET", "/", sid, nil)
-		if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/login" {
-			t.Errorf("sid %q: status %d", sid, rec.Code)
-		}
+		assertJSONError(t, doJSON(h, "GET", "/api/auth/me", sid, ""), http.StatusUnauthorized)
 	}
 
-	do(h, "POST", "/admin/users", "", url.Values{"username": {"budi"}, "password": {"rahasia"}})
+	assertJSONError(t, doJSON(h, "POST", "/api/users", "", `{"username":"budi","password":"rahasia","is_admin":false}`), http.StatusUnauthorized)
 	var n int
 	pool.QueryRow(context.Background(), "SELECT count(*) FROM users WHERE username = 'budi'").Scan(&n)
 	if n != 0 {
@@ -139,8 +156,8 @@ func TestLogout(t *testing.T) {
 	h, _ := testServer(t)
 	sid := login(t, h, "admin", "admin")
 
-	rec := do(h, "POST", "/logout", sid, nil)
-	if rec.Code != http.StatusSeeOther || cookie(rec).MaxAge >= 0 {
+	rec := doJSON(h, "POST", "/api/auth/logout", sid, "")
+	if rec.Code != http.StatusNoContent || cookie(rec).MaxAge >= 0 {
 		t.Fatalf("logout: status %d, cookie %v", rec.Code, cookie(rec))
 	}
 	if loggedIn(h, sid) {
@@ -174,18 +191,18 @@ func TestRotation(t *testing.T) {
 	pool.QueryRow(ctx, "SELECT created_at FROM sessions").Scan(&created)
 	pool.Exec(ctx, "UPDATE sessions SET rotated_at = $1", time.Now().Add(-session.RotateEvery-time.Minute))
 
-	rec := do(h, "GET", "/", old, nil)
+	rec := doJSON(h, "GET", "/api/auth/me", old, "")
 	if rec.Code != http.StatusOK || cookie(rec) == nil || cookie(rec).Value == old {
 		t.Fatalf("no rotation: status %d, cookie %v", rec.Code, cookie(rec))
 	}
 	current := cookie(rec).Value
 
-	rec = do(h, "GET", "/", current, nil)
+	rec = doJSON(h, "GET", "/api/auth/me", current, "")
 	if rec.Code != http.StatusOK || cookie(rec) != nil {
 		t.Errorf("new id: status %d, cookie %v", rec.Code, cookie(rec))
 	}
 
-	rec = do(h, "GET", "/", old, nil)
+	rec = doJSON(h, "GET", "/api/auth/me", old, "")
 	if rec.Code != http.StatusOK || cookie(rec) == nil || cookie(rec).Value != current {
 		t.Errorf("old id in grace: status %d, cookie %v", rec.Code, cookie(rec))
 	}
@@ -209,9 +226,9 @@ func TestCSRF(t *testing.T) {
 	h, _ := testServer(t)
 	sid := login(t, h, "admin", "admin")
 
-	for _, path := range []string{"/login", "/logout"} {
-		req := httptest.NewRequest("POST", path, strings.NewReader("username=admin&password=admin"))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, path := range []string{"/api/auth/login", "/api/auth/logout"} {
+		req := httptest.NewRequest("POST", path, strings.NewReader(`{"username":"admin","password":"admin"}`))
+		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Sec-Fetch-Site", "cross-site")
 		req.AddCookie(&http.Cookie{Name: session.CookieName, Value: sid})
 		rec := httptest.NewRecorder()
@@ -230,42 +247,53 @@ func TestUserManagement(t *testing.T) {
 	ctx := context.Background()
 	admin := login(t, h, "admin", "admin")
 
-	rec := do(h, "POST", "/admin/users", admin, url.Values{"username": {"budi"}, "password": {"rahasia"}, "admin": {"false"}})
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("create: status %d", rec.Code)
+	rec := doJSON(h, "POST", "/api/users", admin, `{"username":"budi","password":"rahasia","is_admin":false}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: status %d %s", rec.Code, rec.Body)
 	}
-	if !strings.Contains(do(h, "GET", "/admin/users", admin, nil).Body.String(), "budi") {
-		t.Error("new user not listed")
+	if strings.Contains(rec.Body.String(), "rahasia") {
+		t.Error("password leaked in create response")
 	}
-	var id int64
+	id := jsonID(t, rec)
+
+	list := doJSON(h, "GET", "/api/users", admin, "")
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"username":"budi"`) {
+		t.Errorf("new user not listed: %d %s", list.Code, list.Body)
+	}
 	var hash string
 	var isAdmin bool
-	pool.QueryRow(ctx, "SELECT id, password_hash, is_admin FROM users WHERE username = 'budi'").Scan(&id, &hash, &isAdmin)
+	pool.QueryRow(ctx, "SELECT password_hash, is_admin FROM users WHERE id = $1", id).Scan(&hash, &isAdmin)
 	if hash == "rahasia" || !authentication.Check(hash, "rahasia") {
 		t.Error("password not stored as a hash")
 	}
 	if isAdmin {
-		t.Error("admin=false should not create an admin user")
+		t.Error("is_admin=false should not create an admin user")
 	}
 	budi := login(t, h, "budi", "rahasia")
 
-	rec = do(h, "POST", "/admin/users", admin, url.Values{"username": {"budi"}, "password": {"lain"}})
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("duplicate username: status %d", rec.Code)
-	}
+	assertJSONError(t, doJSON(h, "POST", "/api/users", admin, `{"username":"budi","password":"lain","is_admin":false}`), http.StatusConflict)
+	assertJSONError(t, doJSON(h, "POST", "/api/users", admin, `{"username":"","password":"x"}`), http.StatusBadRequest)
+	assertJSONError(t, doJSON(h, "POST", "/api/users", admin, `{"username":"cici","password":""}`), http.StatusBadRequest)
 
-	path := "/admin/users/" + strconv.FormatInt(id, 10)
-	do(h, "POST", path+"/password", admin, url.Values{"password": {"baru"}})
-	if do(h, "POST", "/login", "", url.Values{"username": {"budi"}, "password": {"rahasia"}}).Code != http.StatusUnauthorized {
+	path := "/api/users/" + strconv.FormatInt(id, 10)
+	if rec := doJSON(h, "PUT", path+"/password", admin, `{"password":"baru"}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("set password: status %d", rec.Code)
+	}
+	assertJSONError(t, doJSON(h, "PUT", path+"/password", admin, `{"password":""}`), http.StatusBadRequest)
+	assertJSONError(t, doJSON(h, "PUT", "/api/users/999999/password", admin, `{"password":"x"}`), http.StatusNotFound)
+	if doJSON(h, "POST", "/api/auth/login", "", `{"username":"budi","password":"rahasia"}`).Code != http.StatusUnauthorized {
 		t.Error("old password still works")
 	}
 	login(t, h, "budi", "baru")
 
-	do(h, "POST", path+"/delete", admin, nil)
+	if rec := doJSON(h, "DELETE", path, admin, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("delete: status %d", rec.Code)
+	}
+	assertJSONError(t, doJSON(h, "DELETE", path, admin, ""), http.StatusNotFound)
 	if loggedIn(h, budi) {
 		t.Error("deleted user still has a session")
 	}
-	if do(h, "POST", "/login", "", url.Values{"username": {"budi"}, "password": {"baru"}}).Code != http.StatusUnauthorized {
+	if doJSON(h, "POST", "/api/auth/login", "", `{"username":"budi","password":"baru"}`).Code != http.StatusUnauthorized {
 		t.Error("deleted user can log in")
 	}
 }
@@ -275,19 +303,24 @@ func TestPrivilegeChange(t *testing.T) {
 	admin := login(t, h, "admin", "admin")
 	id := addUser(t, pool, "budi", "rahasia")
 	budi := login(t, h, "budi", "rahasia")
-	path := "/admin/users/" + strconv.FormatInt(id, 10) + "/admin"
+	path := "/api/users/" + strconv.FormatInt(id, 10) + "/admin"
 
-	do(h, "POST", path, admin, url.Values{"admin": {"true"}})
-	rec := do(h, "GET", "/", budi, nil)
+	assertJSONError(t, doJSON(h, "PUT", path, admin, `{}`), http.StatusBadRequest)
+	if rec := doJSON(h, "PUT", path, admin, `{"is_admin":true}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("promote: status %d", rec.Code)
+	}
+	rec := doJSON(h, "GET", "/api/auth/me", budi, "")
 	if rec.Code != http.StatusOK || cookie(rec) == nil || cookie(rec).Value == budi {
 		t.Fatalf("promotion did not rotate: status %d, cookie %v", rec.Code, cookie(rec))
 	}
-	if !strings.Contains(rec.Body.String(), "/admin/users") {
+	if !strings.Contains(rec.Body.String(), `"is_admin":true`) {
 		t.Error("promoted user not shown as admin")
 	}
 	budi = cookie(rec).Value
 
-	do(h, "POST", path, admin, url.Values{"admin": {"false"}})
+	if rec := doJSON(h, "PUT", path, admin, `{"is_admin":false}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("demote: status %d", rec.Code)
+	}
 	if loggedIn(h, budi) {
 		t.Error("demoted user still has a session")
 	}
@@ -307,13 +340,14 @@ func TestAccessGrantRotates(t *testing.T) {
 		status                   int
 	}{
 		{"joining a group", "POST", "/api/groups/1/members", `{"user_id":` + strconv.FormatInt(id, 10) + `}`, http.StatusCreated},
+		{"set leader", "PUT", "/api/groups/1", `{"name":"dev","description":"","leader_id":` + strconv.FormatInt(id, 10) + `}`, http.StatusOK},
 		{"access grant", "PUT", "/api/db/1/access/1", `{"access_level":"view_edit"}`, http.StatusNoContent},
 	}
 	for _, s := range steps {
 		if rec := doJSON(h, s.method, s.path, admin, s.body); rec.Code != s.status {
-			t.Fatalf("%s: status %d", s.name, rec.Code)
+			t.Fatalf("%s: status %d %s", s.name, rec.Code, rec.Body)
 		}
-		rec := do(h, "GET", "/", budi, nil)
+		rec := doJSON(h, "GET", "/api/auth/me", budi, "")
 		if rec.Code != http.StatusOK || cookie(rec) == nil || cookie(rec).Value == budi {
 			t.Fatalf("%s did not rotate: status %d, cookie %v", s.name, rec.Code, cookie(rec))
 		}

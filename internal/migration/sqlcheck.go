@@ -2,27 +2,72 @@ package migration
 
 import (
 	"errors"
+	"net/http"
 	"strings"
 	"unicode/utf8"
 )
 
+type Error struct {
+	Status int
+	Msg    string
+}
+
+func (e *Error) Error() string { return e.Msg }
+
 var (
-	ErrName      = errors.New("nama migration wajib diisi (maksimal 100 karakter)")
-	ErrEmptySQL  = errors.New("SQL migration tidak boleh kosong")
-	ErrTxControl = errors.New("SQL tidak boleh berisi BEGIN/COMMIT/ROLLBACK, transaction sudah diatur sistem")
+	ErrName          = &Error{http.StatusBadRequest, "nama migration wajib diisi (maksimal 100 karakter)"}
+	ErrEmptySQL      = &Error{http.StatusBadRequest, "SQL migration tidak boleh kosong"}
+	ErrTxControl     = &Error{http.StatusBadRequest, "SQL tidak boleh berisi BEGIN/COMMIT/ROLLBACK, transaction sudah diatur sistem"}
+	ErrDownRequired  = &Error{http.StatusBadRequest, "sql_down wajib diisi kecuali migration ditandai irreversible dengan alasan"}
+	ErrBatchConfig   = &Error{http.StatusBadRequest, "konfigurasi batch tidak valid"}
+	ErrBatchMultiSQL = &Error{http.StatusBadRequest, "migration mode batch hanya boleh berisi satu SQL statement"}
 )
 
-// statement yang bakal ngerusak transaction buatan sistem
 var txKeywords = map[string]bool{
 	"BEGIN": true, "START": true, "COMMIT": true, "END": true, "ROLLBACK": true, "ABORT": true,
 }
 
-// cek nama dan isi SQL sebelum disimpan
-func Validate(name, sql string) error {
-	name = strings.TrimSpace(name)
-	if name == "" || utf8.RuneCountInString(name) > 100 {
-		return ErrName
+type Input struct {
+	Name               string `json:"name"`
+	SQLUp              string `json:"sql_up"`
+	SQLDown            string `json:"sql_down"`
+	IrreversibleReason string `json:"irreversible_reason"`
+	BatchColumn        string `json:"batch_column"`
+	BatchSize          int    `json:"batch_size"`
+}
+
+func cleanInput(in Input) (Input, error) {
+	in.Name = strings.TrimSpace(in.Name)
+	in.IrreversibleReason = strings.TrimSpace(in.IrreversibleReason)
+	if in.BatchSize == 0 {
+		in.BatchColumn = ""
+	} else {
+		in.BatchColumn = strings.TrimSpace(in.BatchColumn)
 	}
+	if in.Name == "" || utf8.RuneCountInString(in.Name) > 100 {
+		return Input{}, ErrName
+	}
+	if in.BatchSize < 0 {
+		return Input{}, ErrBatchConfig
+	}
+	batch := in.BatchSize > 0
+	if batch && in.BatchColumn == "" {
+		return Input{}, ErrBatchConfig
+	}
+	if err := validateSQL(in.SQLUp, batch); err != nil {
+		return Input{}, err
+	}
+	if in.IrreversibleReason == "" {
+		if err := validateSQL(in.SQLDown, batch); errors.Is(err, ErrEmptySQL) {
+			return Input{}, ErrDownRequired
+		} else if err != nil {
+			return Input{}, err
+		}
+	}
+	return in, nil
+}
+
+func validateSQL(sql string, singleStmt bool) error {
 	stmts := splitStatements(sql)
 	if len(stmts) == 0 {
 		return ErrEmptySQL
@@ -32,10 +77,12 @@ func Validate(name, sql string) error {
 			return ErrTxControl
 		}
 	}
+	if singleStmt && len(stmts) != 1 {
+		return ErrBatchMultiSQL
+	}
 	return nil
 }
 
-// pecah SQL per statement, titik koma di dalam string/komentar/dollar-quote dilewatin
 func splitStatements(sql string) []string {
 	var out []string
 	start := 0
@@ -69,7 +116,6 @@ func splitStatements(sql string) []string {
 	return out
 }
 
-// lompat ke setelah penutup berikutnya, kalau ga ketemu ya sampai akhir
 func skipUntil(s string, from int, end string) int {
 	j := strings.Index(s[from:], end)
 	if j < 0 {
@@ -78,7 +124,6 @@ func skipUntil(s string, from int, end string) int {
 	return from + j + len(end)
 }
 
-// baca tag dollar-quote kayak $$ atau $body$
 func dollarTag(s string) (string, bool) {
 	for i := 1; i < len(s); i++ {
 		c := s[i]
@@ -94,7 +139,6 @@ func dollarTag(s string) (string, bool) {
 	return "", false
 }
 
-// buang komentar dan spasi di awal statement
 func stripComments(s string) string {
 	for {
 		s = strings.TrimSpace(s)
@@ -109,7 +153,6 @@ func stripComments(s string) string {
 	}
 }
 
-// kata pertama statement dalam huruf besar
 func firstWord(s string) string {
 	s = stripComments(s)
 	end := strings.IndexFunc(s, func(r rune) bool {

@@ -3,11 +3,10 @@ package groups
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
-	"strconv"
 	"strings"
 
+	"github.com/Ahmad-FP/K03-15-WBD/internal/httpx"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,153 +16,198 @@ type Handler struct {
 	DB       *pgxpool.Pool
 	Sessions *session.Store
 }
+
 type Group struct {
-	ID          int64  `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	ID             int64  `json:"id"`
+	Name           string `json:"name"`
+	Description    string `json:"description"`
+	LeaderID       *int64 `json:"leader_id"`
+	LeaderUsername string `json:"leader_username"`
 }
+
 type Member struct {
 	ID       int64  `json:"id"`
 	Username string `json:"username"`
 }
-type payload struct {
+
+type optID struct {
+	set bool
+	val *int64
+}
+
+func (o *optID) UnmarshalJSON(b []byte) error {
+	o.set = true
+	if string(b) == "null" {
+		return nil
+	}
+	var n int64
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	o.val = &n
+	return nil
+}
+
+type groupPayload struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	UserID      int64  `json:"user_id"`
+	LeaderID    optID  `json:"leader_id"`
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.DB.Query(r.Context(), `SELECT id, name, description FROM platform_groups ORDER BY name`)
+	rows, err := h.DB.Query(r.Context(), `SELECT g.id, g.name, g.description, g.leader_id, COALESCE(u.username, '')
+		FROM platform_groups g LEFT JOIN users u ON u.id = g.leader_id ORDER BY g.name`)
 	if err != nil {
-		http.Error(w, "gagal mengambil group", 500)
+		httpx.Error(w, http.StatusInternalServerError, "gagal mengambil group")
 		return
 	}
-	defer rows.Close()
-	result := []Group{}
-	for rows.Next() {
-		var g Group
-		if err := rows.Scan(&g.ID, &g.Name, &g.Description); err != nil {
-			http.Error(w, "gagal membaca group", 500)
-			return
-		}
-		result = append(result, g)
-	}
-	if rows.Err() != nil {
-		http.Error(w, "gagal membaca group", 500)
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Group])
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "gagal membaca group")
 		return
 	}
-	writeJSON(w, 200, result)
+	if result == nil {
+		result = []Group{}
+	}
+	httpx.JSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
-	var p payload
-	if !decode(w, r, &p) {
-		return
-	}
-	p.Name = strings.TrimSpace(p.Name)
-	p.Description = strings.TrimSpace(p.Description)
-	if p.Name == "" || len(p.Name) > 100 {
-		http.Error(w, "nama group wajib diisi (maksimal 100 karakter)", 400)
+	var p groupPayload
+	if !decodeGroup(w, r, &p) {
 		return
 	}
 	var g Group
-	err := h.DB.QueryRow(r.Context(), `INSERT INTO platform_groups(name, description) VALUES($1,$2) RETURNING id,name,description`, p.Name, p.Description).Scan(&g.ID, &g.Name, &g.Description)
-	if err != nil {
-		http.Error(w, "group tidak dapat dibuat; nama mungkin sudah digunakan", 409)
+	err := h.DB.QueryRow(r.Context(), `
+		WITH g AS (
+			INSERT INTO platform_groups (name, description, leader_id) VALUES ($1, $2, $3) RETURNING *
+		), m AS (
+			INSERT INTO group_members (group_id, user_id)
+			SELECT id, leader_id FROM g WHERE leader_id IS NOT NULL ON CONFLICT DO NOTHING
+		)
+		SELECT g.id, g.name, g.description, g.leader_id, COALESCE(u.username, '')
+		FROM g LEFT JOIN users u ON u.id = g.leader_id`,
+		p.Name, p.Description, p.LeaderID.val).
+		Scan(&g.ID, &g.Name, &g.Description, &g.LeaderID, &g.LeaderUsername)
+	if httpx.IsPGCode(err, "23505") || httpx.IsPGCode(err, "23503") {
+		httpx.Error(w, http.StatusConflict, "group tidak dapat dibuat; nama sudah digunakan atau leader tidak ditemukan")
 		return
 	}
-	writeJSON(w, 201, g)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "gagal membuat group")
+		return
+	}
+	if g.LeaderID != nil {
+		h.Sessions.RotateUser(r.Context(), *g.LeaderID)
+	}
+	httpx.JSON(w, http.StatusCreated, g)
 }
 
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
+	id, ok := httpx.ID(w, r, "id")
 	if !ok {
 		return
 	}
-	var p payload
-	if !decode(w, r, &p) {
-		return
-	}
-	p.Name = strings.TrimSpace(p.Name)
-	if p.Name == "" || len(p.Name) > 100 {
-		http.Error(w, "nama group wajib diisi (maksimal 100 karakter)", 400)
+	var p groupPayload
+	if !decodeGroup(w, r, &p) {
 		return
 	}
 	var g Group
-	err := h.DB.QueryRow(r.Context(), `UPDATE platform_groups SET name=$2, description=$3, updated_at=now() WHERE id=$1 RETURNING id,name,description`, id, p.Name, strings.TrimSpace(p.Description)).Scan(&g.ID, &g.Name, &g.Description)
+	err := h.DB.QueryRow(r.Context(), `
+		WITH g AS (
+			UPDATE platform_groups
+			SET name = $2, description = $3,
+				leader_id = CASE WHEN $4 THEN $5 ELSE leader_id END,
+				updated_at = now()
+			WHERE id = $1
+			RETURNING *
+		), m AS (
+			INSERT INTO group_members (group_id, user_id)
+			SELECT id, leader_id FROM g WHERE $4 AND leader_id IS NOT NULL ON CONFLICT DO NOTHING
+		)
+		SELECT g.id, g.name, g.description, g.leader_id, COALESCE(u.username, '')
+		FROM g LEFT JOIN users u ON u.id = g.leader_id`,
+		id, p.Name, p.Description, p.LeaderID.set, p.LeaderID.val).
+		Scan(&g.ID, &g.Name, &g.Description, &g.LeaderID, &g.LeaderUsername)
 	if errors.Is(err, pgx.ErrNoRows) {
-		http.Error(w, "group tidak ditemukan", 404)
+		httpx.Error(w, http.StatusNotFound, "group tidak ditemukan")
+		return
+	}
+	if httpx.IsPGCode(err, "23505") || httpx.IsPGCode(err, "23503") {
+		httpx.Error(w, http.StatusConflict, "group tidak dapat diperbarui; nama sudah digunakan atau leader tidak ditemukan")
 		return
 	}
 	if err != nil {
-		http.Error(w, "group tidak dapat diperbarui", 409)
+		httpx.Error(w, http.StatusInternalServerError, "gagal memperbarui group")
 		return
 	}
-	writeJSON(w, 200, g)
+	if p.LeaderID.set && g.LeaderID != nil {
+		h.Sessions.RotateUser(r.Context(), *g.LeaderID)
+	}
+	httpx.JSON(w, http.StatusOK, g)
 }
 
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
+	id, ok := httpx.ID(w, r, "id")
 	if !ok {
 		return
 	}
-	// session anggota dicabut duluan, habis group dihapus daftar anggotanya ikut hilang
 	h.Sessions.RevokeGroup(r.Context(), id)
-	tag, err := h.DB.Exec(r.Context(), `DELETE FROM platform_groups WHERE id=$1`, id)
+	tag, err := h.DB.Exec(r.Context(), `DELETE FROM platform_groups WHERE id = $1`, id)
 	if err != nil {
-		http.Error(w, "group tidak dapat dihapus", 500)
+		httpx.Error(w, http.StatusInternalServerError, "group tidak dapat dihapus")
 		return
 	}
 	if tag.RowsAffected() == 0 {
-		http.Error(w, "group tidak ditemukan", 404)
+		httpx.Error(w, http.StatusNotFound, "group tidak ditemukan")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
+	id, ok := httpx.ID(w, r, "id")
 	if !ok {
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `SELECT u.id,u.username FROM group_members gm JOIN users u ON u.id=gm.user_id WHERE gm.group_id=$1 ORDER BY u.username`, id)
+	rows, err := h.DB.Query(r.Context(), `SELECT u.id, u.username FROM group_members gm JOIN users u ON u.id = gm.user_id WHERE gm.group_id = $1 ORDER BY u.username`, id)
 	if err != nil {
-		http.Error(w, "gagal mengambil anggota", 500)
+		httpx.Error(w, http.StatusInternalServerError, "gagal mengambil anggota")
 		return
 	}
-	defer rows.Close()
-	result := []Member{}
-	for rows.Next() {
-		var m Member
-		if err := rows.Scan(&m.ID, &m.Username); err != nil {
-			http.Error(w, "gagal membaca anggota", 500)
-			return
-		}
-		result = append(result, m)
-	}
-	if rows.Err() != nil {
-		http.Error(w, "gagal membaca anggota", 500)
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Member])
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "gagal membaca anggota")
 		return
 	}
-	writeJSON(w, 200, result)
+	if result == nil {
+		result = []Member{}
+	}
+	httpx.JSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) AddMember(w http.ResponseWriter, r *http.Request) {
-	gid, ok := pathID(w, r)
+	gid, ok := httpx.ID(w, r, "id")
 	if !ok {
 		return
 	}
-	var p payload
-	if !decode(w, r, &p) {
+	var p struct {
+		UserID int64 `json:"user_id"`
+	}
+	if !httpx.Decode(w, r, &p) {
 		return
 	}
 	if p.UserID <= 0 {
-		http.Error(w, "user_id tidak valid", 400)
+		httpx.Error(w, http.StatusBadRequest, "user_id tidak valid")
 		return
 	}
-	_, err := h.DB.Exec(r.Context(), `INSERT INTO group_members(group_id,user_id) VALUES($1,$2)`, gid, p.UserID)
+	_, err := h.DB.Exec(r.Context(), `INSERT INTO group_members (group_id, user_id) VALUES ($1, $2)`, gid, p.UserID)
+	if httpx.IsPGCode(err, "23505") || httpx.IsPGCode(err, "23503") {
+		httpx.Error(w, http.StatusConflict, "anggota tidak dapat ditambahkan; group/user tidak ditemukan atau sudah menjadi anggota")
+		return
+	}
 	if err != nil {
-		http.Error(w, "anggota tidak dapat ditambahkan; group/user mungkin tidak ada atau sudah menjadi anggota", 409)
+		httpx.Error(w, http.StatusInternalServerError, "gagal menambahkan anggota")
 		return
 	}
 	h.Sessions.RotateUser(r.Context(), p.UserID)
@@ -171,52 +215,48 @@ func (h *Handler) AddMember(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RemoveMember(w http.ResponseWriter, r *http.Request) {
-	gid, ok := pathID(w, r)
+	gid, ok := httpx.ID(w, r, "id")
 	if !ok {
 		return
 	}
-	uid, err := strconv.ParseInt(r.PathValue("userId"), 10, 64)
-	if err != nil || uid <= 0 {
-		http.Error(w, "userId tidak valid", 400)
+	uid, ok := httpx.ID(w, r, "userId")
+	if !ok {
 		return
 	}
-	tag, err := h.DB.Exec(r.Context(), `DELETE FROM group_members WHERE group_id=$1 AND user_id=$2`, gid, uid)
+	var removed int
+	err := h.DB.QueryRow(r.Context(), `
+		WITH d AS (
+			DELETE FROM group_members WHERE group_id = $1 AND user_id = $2 RETURNING user_id
+		), u AS (
+			UPDATE platform_groups SET leader_id = NULL, updated_at = now()
+			WHERE id = $1 AND leader_id IN (SELECT user_id FROM d)
+		)
+		SELECT count(*) FROM d`, gid, uid).Scan(&removed)
 	if err != nil {
-		http.Error(w, "gagal menghapus anggota", 500)
+		httpx.Error(w, http.StatusInternalServerError, "gagal menghapus anggota")
 		return
 	}
-	if tag.RowsAffected() == 0 {
-		http.Error(w, "keanggotaan tidak ditemukan", 404)
+	if removed == 0 {
+		httpx.Error(w, http.StatusNotFound, "keanggotaan tidak ditemukan")
 		return
 	}
 	h.Sessions.RevokeUser(r.Context(), uid)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil || id <= 0 {
-		http.Error(w, "id tidak valid", 400)
-		return 0, false
-	}
-	return id, true
-}
-func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	d := json.NewDecoder(r.Body)
-	d.DisallowUnknownFields()
-	if err := d.Decode(v); err != nil {
-		http.Error(w, "JSON tidak valid", http.StatusBadRequest)
+func decodeGroup(w http.ResponseWriter, r *http.Request, p *groupPayload) bool {
+	if !httpx.Decode(w, r, p) {
 		return false
 	}
-	if err := d.Decode(&struct{}{}); err != io.EOF {
-		http.Error(w, "body harus berisi tepat satu objek JSON", http.StatusBadRequest)
+	p.Name = strings.TrimSpace(p.Name)
+	p.Description = strings.TrimSpace(p.Description)
+	if p.Name == "" {
+		httpx.Error(w, http.StatusBadRequest, "nama group wajib diisi")
+		return false
+	}
+	if p.LeaderID.val != nil && *p.LeaderID.val <= 0 {
+		httpx.Error(w, http.StatusBadRequest, "leader_id tidak valid")
 		return false
 	}
 	return true
-}
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
 }

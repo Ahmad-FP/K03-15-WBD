@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Ahmad-FP/K03-15-WBD/internal/httpx"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -39,10 +40,15 @@ func FromContext(ctx context.Context) (Session, bool) {
 	return s, ok
 }
 
-func (s *Store) Start(w http.ResponseWriter, r *http.Request, userID int64) {
+func (s *Store) Start(w http.ResponseWriter, r *http.Request, userID int64) error {
 	id := rand.Text()
-	s.DB.Exec(r.Context(), "INSERT INTO sessions (id, user_id, created_at, last_seen_at, rotated_at) VALUES ($1, $2, $3, $3, $3)", id, userID, time.Now())
+	if _, err := s.DB.Exec(r.Context(),
+		"INSERT INTO sessions (id, user_id, created_at, last_seen_at, rotated_at) VALUES ($1, $2, $3, $3, $3)",
+		id, userID, time.Now()); err != nil {
+		return err
+	}
 	setCookie(w, r, id, 0)
+	return nil
 }
 
 func (s *Store) End(w http.ResponseWriter, r *http.Request) {
@@ -62,7 +68,6 @@ func (s *Store) RevokeUser(ctx context.Context, userID int64) {
 	s.DB.Exec(ctx, "DELETE FROM sessions WHERE user_id = $1", userID)
 }
 
-// logout paksa semua anggota group, dipakai waktu akses group dicabut
 func (s *Store) RevokeGroup(ctx context.Context, groupID int64) {
 	s.DB.Exec(ctx, "DELETE FROM sessions WHERE user_id IN (SELECT user_id FROM group_members WHERE group_id = $1)", groupID)
 }
@@ -72,7 +77,7 @@ func (s *Store) Require(next http.HandlerFunc) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		sess, ok := s.resolve(w, r)
 		if !ok {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			httpx.Error(w, http.StatusUnauthorized, "belum login")
 			return
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), key{}, sess)))

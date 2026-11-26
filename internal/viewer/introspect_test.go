@@ -22,15 +22,15 @@ func TestConstraintType(t *testing.T) {
 }
 
 func TestToCell(t *testing.T) {
-	if c := toCell(nil); !c.Null {
-		t.Error("nil harus jadi NULL")
+	if c := toCell(nil); c != nil {
+		t.Errorf("nil harus jadi nil, got %v", c)
 	}
-	if c := toCell([]byte{}); c.Null || c.Text != "" {
-		t.Error("string kosong bukan NULL")
+	if c := toCell([]byte{}); c != "" {
+		t.Errorf("string kosong bukan nil, got %v", c)
 	}
 	long := strings.Repeat("é", maxCell+10)
-	if c := toCell([]byte(long)); len([]rune(c.Text)) != maxCell+1 || !strings.HasSuffix(c.Text, "…") {
-		t.Errorf("isi panjang tidak dipotong dengan benar: %d rune", len([]rune(c.Text)))
+	if c, ok := toCell([]byte(long)).(string); !ok || len([]rune(c)) != maxCell+1 || !strings.HasSuffix(c, "…") {
+		t.Errorf("isi panjang tidak dipotong dengan benar: %q", c)
 	}
 }
 

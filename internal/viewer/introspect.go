@@ -12,33 +12,33 @@ import (
 var errNoTable = errors.New("table tidak ditemukan")
 
 type schemaInfo struct {
-	Name   string
-	Tables []tableInfo
+	Name   string      `json:"name"`
+	Tables []tableInfo `json:"tables"`
 }
 
 type tableInfo struct {
-	Name string
-	Kind string
+	Name string `json:"name"`
+	Kind string `json:"kind"`
 }
 
 type column struct {
-	Name     string
-	Type     string
-	Nullable bool
-	Default  string
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Nullable bool   `json:"nullable"`
+	Default  string `json:"default"`
 }
 
 type constraint struct {
-	Name       string
-	Type       string
-	Definition string
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Definition string `json:"definition"`
 }
 
 type index struct {
-	Name       string
-	Definition string
-	Unique     bool
-	Primary    bool
+	Name       string `json:"name"`
+	Definition string `json:"definition"`
+	Unique     bool   `json:"unique"`
+	Primary    bool   `json:"primary"`
 }
 
 // ambil semua schema user beserta table/view di dalamnya
@@ -53,14 +53,14 @@ func listSchemas(ctx context.Context, tx pgx.Tx) ([]schemaInfo, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []schemaInfo
+	out := []schemaInfo{}
 	for rows.Next() {
 		var schema, name, kind string
 		if err := rows.Scan(&schema, &name, &kind); err != nil {
 			return nil, err
 		}
 		if len(out) == 0 || out[len(out)-1].Name != schema {
-			out = append(out, schemaInfo{Name: schema})
+			out = append(out, schemaInfo{Name: schema, Tables: []tableInfo{}})
 		}
 		if name != "" {
 			last := &out[len(out)-1]
@@ -90,7 +90,11 @@ func listColumns(ctx context.Context, tx pgx.Tx, oid uint32) ([]column, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowToStructByPos[column])
+	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[column])
+	if list == nil {
+		list = []column{}
+	}
+	return list, err
 }
 
 // constraint table (PK, FK, unique, check, dll)
@@ -101,6 +105,9 @@ func listConstraints(ctx context.Context, tx pgx.Tx, oid uint32) ([]constraint, 
 		return nil, err
 	}
 	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[constraint])
+	if list == nil {
+		list = []constraint{}
+	}
 	for i := range list {
 		list[i].Type = constraintType(list[i].Type)
 	}
@@ -115,7 +122,11 @@ func listIndexes(ctx context.Context, tx pgx.Tx, oid uint32) ([]index, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowToStructByPos[index])
+	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[index])
+	if list == nil {
+		list = []index{}
+	}
+	return list, err
 }
 
 // terjemahin kode relkind postgres ke nama yang kebaca
@@ -157,17 +168,6 @@ const (
 	maxCell  = 200
 )
 
-type cell struct {
-	Text string
-	Null bool
-}
-
-type tableData struct {
-	Columns []string
-	Rows    [][]cell
-	HasNext bool
-}
-
 // kolom primary key, dipakai buat ngurutin data biar pagination stabil
 func primaryKey(ctx context.Context, tx pgx.Tx, oid uint32) ([]string, error) {
 	rows, err := tx.Query(ctx, `SELECT a.attname FROM pg_index i
@@ -181,10 +181,10 @@ func primaryKey(ctx context.Context, tx pgx.Tx, oid uint32) ([]string, error) {
 }
 
 // ambil isi table per halaman, nilainya pakai format text bawaan postgres
-func readRows(ctx context.Context, tx pgx.Tx, schema, table string, oid uint32, page int) (tableData, error) {
+func readRows(ctx context.Context, tx pgx.Tx, schema, table string, oid uint32, page int) ([][]any, bool, error) {
 	pk, err := primaryKey(ctx, tx, oid)
 	if err != nil {
-		return tableData{}, err
+		return nil, false, err
 	}
 	q := "SELECT * FROM " + pgx.Identifier{schema, table}.Sanitize()
 	if len(pk) > 0 {
@@ -197,38 +197,36 @@ func readRows(ctx context.Context, tx pgx.Tx, schema, table string, oid uint32, 
 	q += " LIMIT $1 OFFSET $2"
 	rows, err := tx.Query(ctx, q, pgx.QueryResultFormats{pgx.TextFormatCode}, pageSize+1, (page-1)*pageSize)
 	if err != nil {
-		return tableData{}, err
+		return nil, false, err
 	}
 	defer rows.Close()
-	var data tableData
-	for _, f := range rows.FieldDescriptions() {
-		data.Columns = append(data.Columns, f.Name)
-	}
+	out := [][]any{}
+	hasNext := false
 	for rows.Next() {
-		if len(data.Rows) == pageSize {
-			data.HasNext = true
+		if len(out) == pageSize {
+			hasNext = true
 			break
 		}
 		raw := rows.RawValues()
-		row := make([]cell, len(raw))
+		row := make([]any, len(raw))
 		for i, v := range raw {
 			row[i] = toCell(v)
 		}
-		data.Rows = append(data.Rows, row)
+		out = append(out, row)
 	}
-	return data, rows.Err()
+	return out, hasNext, rows.Err()
 }
 
-// nilai NULL ditandain, yang kepanjangan dipotong biar tabel ga melebar
-func toCell(raw []byte) cell {
+// nilai NULL jadi nil (JSON null), yang kepanjangan dipotong biar tabel ga melebar
+func toCell(raw []byte) any {
 	if raw == nil {
-		return cell{Null: true}
+		return nil
 	}
 	r := []rune(string(raw))
 	if len(r) > maxCell {
-		return cell{Text: string(r[:maxCell]) + "…"}
+		return string(r[:maxCell]) + "…"
 	}
-	return cell{Text: string(r)}
+	return string(r)
 }
 
 // nomor halaman dari query string, minimal 1 dan dibatasin biar OFFSET ga overflow

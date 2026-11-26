@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// daftarin database target lewat API admin, isinya schema baru di database test
 func addTarget(t *testing.T, h http.Handler, admin, dsn string) int64 {
 	t.Helper()
 	t.Setenv("DATABASE_CREDENTIALS_KEY", strings.Repeat("ab", 32))
@@ -27,7 +26,6 @@ func addTarget(t *testing.T, h http.Handler, admin, dsn string) int64 {
 	return d.ID
 }
 
-// bikin schema kosong buat jadi database target, balikin pool + DSN-nya
 func targetSchema(t *testing.T) (*pgxpool.Pool, string) {
 	t.Helper()
 	ctx := context.Background()
@@ -52,8 +50,7 @@ func targetSchema(t *testing.T) (*pgxpool.Pool, string) {
 	return pool, dsn
 }
 
-// kasih user akses ke database lewat group baru
-func grant(t *testing.T, pool *pgxpool.Pool, userID, dbID int64, level string) {
+func grant(t *testing.T, pool *pgxpool.Pool, userID, dbID int64, level string) int64 {
 	t.Helper()
 	ctx := context.Background()
 	var gid int64
@@ -62,10 +59,11 @@ func grant(t *testing.T, pool *pgxpool.Pool, userID, dbID int64, level string) {
 	}
 	pool.Exec(ctx, "INSERT INTO group_members (group_id, user_id) VALUES ($1, $2)", gid, userID)
 	pool.Exec(ctx, "INSERT INTO group_database_access (group_id, database_id, access_level) VALUES ($1, $2, $3)", gid, dbID, level)
+	return gid
 }
 
 func dbPath(id int64) string {
-	return "/databases/" + strconv.FormatInt(id, 10)
+	return "/api/databases/" + strconv.FormatInt(id, 10)
 }
 
 func TestDatabaseList(t *testing.T) {
@@ -78,15 +76,21 @@ func TestDatabaseList(t *testing.T) {
 	grant(t, pool, budi, id, "view_only")
 	grant(t, pool, budi, id, "view_edit")
 
-	rec := do(h, "GET", "/databases", login(t, h, "budi", "rahasia"), nil)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), dbPath(id)) {
+	rec := doJSON(h, "GET", "/api/databases", login(t, h, "budi", "rahasia"), "")
+	if rec.Code != http.StatusOK {
 		t.Fatalf("budi: status %d", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "View + Edit") {
-		t.Error("akses efektif harus ambil yang paling tinggi")
+	var list []struct {
+		ID          int64  `json:"id"`
+		AccessLevel string `json:"access_level"`
 	}
-	if strings.Contains(do(h, "GET", "/databases", login(t, h, "siti", "rahasia"), nil).Body.String(), dbPath(id)) {
-		t.Error("siti lihat database yang bukan aksesnya")
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || len(list) != 1 || list[0].ID != id || list[0].AccessLevel != "view_edit" {
+		t.Fatalf("budi list = %s", rec.Body)
+	}
+
+	sitiRec := doJSON(h, "GET", "/api/databases", login(t, h, "siti", "rahasia"), "")
+	if sitiRec.Code != http.StatusOK || strings.TrimSpace(sitiRec.Body.String()) != "[]" {
+		t.Errorf("siti seharusnya dapat []: %d %s", sitiRec.Code, sitiRec.Body)
 	}
 }
 
@@ -112,29 +116,31 @@ func TestViewerSchema(t *testing.T) {
 	}
 	sid := login(t, h, "budi", "rahasia")
 
-	body := do(h, "GET", dbPath(id), sid, nil).Body.String()
-	for _, want := range []string{"kota", "warga", "warga_dewasa", "(view)"} {
+	ov := doJSON(h, "GET", dbPath(id), sid, "")
+	if ov.Code != http.StatusOK {
+		t.Fatalf("overview: status %d %s", ov.Code, ov.Body)
+	}
+	body := ov.Body.String()
+	for _, want := range []string{`"can_edit":false`, `"kota"`, `"warga"`, `"warga_dewasa"`, `"view"`} {
 		if !strings.Contains(body, want) {
-			t.Errorf("overview tidak memuat %q", want)
+			t.Errorf("overview tidak memuat %q: %s", want, body)
 		}
 	}
 
 	var schema string
 	target.QueryRow(context.Background(), "SELECT current_schema()").Scan(&schema)
-	rec := do(h, "GET", dbPath(id)+"/tables/"+schema+"/warga", sid, nil)
+	rec := doJSON(h, "GET", dbPath(id)+"/tables/"+schema+"/warga", sid, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("table: status %d %s", rec.Code, rec.Body)
 	}
 	body = rec.Body.String()
-	for _, want := range []string{"umur", "integer", "warga_pkey", "PRIMARY KEY", "FOREIGN KEY", "CHECK", "idx_warga_nama"} {
+	for _, want := range []string{`"umur"`, `"integer"`, `"warga_pkey"`, `"PRIMARY KEY"`, `"FOREIGN KEY"`, `"CHECK"`, `"idx_warga_nama"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("detail table tidak memuat %q", want)
 		}
 	}
 
-	if rec := do(h, "GET", dbPath(id)+"/tables/"+schema+"/gaada", sid, nil); rec.Code != http.StatusNotFound {
-		t.Errorf("table tidak ada: status %d", rec.Code)
-	}
+	assertJSONError(t, doJSON(h, "GET", dbPath(id)+"/tables/"+schema+"/gaada", sid, ""), http.StatusNotFound)
 }
 
 func TestViewerAccessDenied(t *testing.T) {
@@ -147,14 +153,10 @@ func TestViewerAccessDenied(t *testing.T) {
 
 	for _, sid := range []string{siti, admin} {
 		for _, path := range []string{dbPath(id), dbPath(id) + "/tables/public/x"} {
-			if rec := do(h, "GET", path, sid, nil); rec.Code != http.StatusForbidden {
-				t.Errorf("%s tanpa akses: status %d", path, rec.Code)
-			}
+			assertJSONError(t, doJSON(h, "GET", path, sid, ""), http.StatusForbidden)
 		}
 	}
-	if rec := do(h, "GET", dbPath(id), "", nil); rec.Code != http.StatusSeeOther {
-		t.Errorf("tanpa session: status %d", rec.Code)
-	}
+	assertJSONError(t, doJSON(h, "GET", dbPath(id), "", ""), http.StatusUnauthorized)
 }
 
 func TestViewerConnectionFailure(t *testing.T) {
@@ -164,15 +166,10 @@ func TestViewerConnectionFailure(t *testing.T) {
 	budi := addUser(t, pool, "budi", "rahasia")
 	grant(t, pool, budi, id, "view_only")
 
-	rec := do(h, "GET", dbPath(id), login(t, h, "budi", "rahasia"), nil)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status %d", rec.Code)
-	}
+	rec := doJSON(h, "GET", dbPath(id), login(t, h, "budi", "rahasia"), "")
+	assertJSONError(t, rec, http.StatusBadGateway)
 	if strings.Contains(rec.Body.String(), "rahasiaDB") {
 		t.Error("password database target bocor di response")
-	}
-	if !strings.Contains(rec.Body.String(), dbPath(id)+"/migrations") {
-		t.Error("link riwayat migration hilang waktu koneksi gagal")
 	}
 }
 
@@ -195,16 +192,25 @@ func TestViewerData(t *testing.T) {
 	sid := login(t, h, "budi", "rahasia")
 	path := dbPath(id) + "/tables/" + schema + "/barang"
 
-	body := do(h, "GET", path, sid, nil).Body.String()
-	if !strings.Contains(body, "<i>NULL</i>") || !strings.Contains(body, "barang-50") || strings.Contains(body, "barang-51<") {
-		t.Error("halaman 1 harus berisi baris 1-50")
+	var resp struct {
+		Page    int     `json:"page"`
+		HasNext bool    `json:"has_next"`
+		Data    [][]any `json:"data"`
 	}
-	if !strings.Contains(body, `{&#34;stok&#34;: 1}`) || !strings.Contains(body, "?page=2") {
-		t.Error("jsonb atau link halaman berikutnya tidak muncul")
+	rec := doJSON(h, "GET", path, sid, "")
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &resp) != nil {
+		t.Fatalf("page 1: status %d %s", rec.Code, rec.Body)
+	}
+	if resp.Page != 1 || len(resp.Data) != 50 || !resp.HasNext || resp.Data[0][1] != nil || resp.Data[49][1] != "barang-50" {
+		t.Errorf("page 1 tidak sesuai: len=%d hasNext=%v row0=%v row49=%v", len(resp.Data), resp.HasNext, resp.Data[0], resp.Data[49])
 	}
 
-	body = do(h, "GET", path+"?page=2", sid, nil).Body.String()
-	if !strings.Contains(body, "barang-60") || strings.Contains(body, "barang-50<") || strings.Contains(body, "?page=3") {
-		t.Error("halaman 2 harus berisi baris 51-60 tanpa link berikutnya")
+	resp.Data = nil
+	rec = doJSON(h, "GET", path+"?page=2", sid, "")
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &resp) != nil {
+		t.Fatalf("page 2: status %d", rec.Code)
+	}
+	if resp.Page != 2 || len(resp.Data) != 10 || resp.HasNext || resp.Data[9][1] != "barang-60" {
+		t.Errorf("page 2 tidak sesuai: len=%d hasNext=%v", len(resp.Data), resp.HasNext)
 	}
 }

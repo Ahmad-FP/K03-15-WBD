@@ -1,112 +1,80 @@
 package viewer
 
 import (
-	"context"
-	"embed"
 	"errors"
-	"html/template"
 	"net/http"
-	"net/url"
 	"strconv"
 
 	"github.com/Ahmad-FP/K03-15-WBD/internal/authorization"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/db"
+	"github.com/Ahmad-FP/K03-15-WBD/internal/httpx"
 	"github.com/Ahmad-FP/K03-15-WBD/internal/session"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-//go:embed *.html
-var files embed.FS
-
-var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
-	"pathEscape": url.PathEscape,
-	"inc":        func(n int) int { return n + 1 },
-	"dec":        func(n int) int { return n - 1 },
-}).ParseFS(files, "*.html"))
-
 type Handler struct{ DB *pgxpool.Pool }
 
-type database struct {
-	ID        int64
-	Name      string
-	HostLabel string
-	Level     authorization.Level
+type databaseItem struct {
+	ID          int64               `json:"id"`
+	Name        string              `json:"name"`
+	HostLabel   string              `json:"host_label"`
+	AccessLevel authorization.Level `json:"access_level"`
 }
 
-type page struct {
-	ID      int64
-	Name    string
-	CanEdit bool
-	Alert   string
-}
-
-// daftar database yang bisa dibuka user lewat group-nya
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.DB.Query(r.Context(), `SELECT d.id, d.name, d.host_label, a.access_level
+	rows, err := h.DB.Query(r.Context(), `SELECT d.id, d.name, d.host_label,
+			CASE WHEN bool_or(a.access_level = 'view_edit') THEN 'view_edit' ELSE 'view_only' END
 		FROM managed_databases d
 		JOIN group_database_access a ON a.database_id = d.id
 		JOIN group_members gm ON gm.group_id = a.group_id
-		WHERE gm.user_id = $1 ORDER BY d.name, d.id`, session.Current(r).UserID)
+		WHERE gm.user_id = $1
+		GROUP BY d.id
+		ORDER BY d.name, d.id`, session.Current(r).UserID)
 	if err != nil {
-		http.Error(w, "gagal mengambil daftar database", http.StatusInternalServerError)
+		httpx.Error(w, http.StatusInternalServerError, "gagal mengambil daftar database")
 		return
 	}
-	defer rows.Close()
-	var list []database
-	levels := map[int64][]authorization.Level{}
-	for rows.Next() {
-		var d database
-		if err := rows.Scan(&d.ID, &d.Name, &d.HostLabel, &d.Level); err != nil {
-			http.Error(w, "gagal membaca daftar database", http.StatusInternalServerError)
-			return
-		}
-		if _, seen := levels[d.ID]; !seen {
-			list = append(list, d)
-		}
-		levels[d.ID] = append(levels[d.ID], d.Level)
-	}
-	if rows.Err() != nil {
-		http.Error(w, "gagal membaca daftar database", http.StatusInternalServerError)
+	list, err := pgx.CollectRows(rows, pgx.RowToStructByPos[databaseItem])
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "gagal membaca daftar database")
 		return
 	}
-	for i := range list {
-		list[i].Level = authorization.Effective(levels[list[i].ID])
+	if list == nil {
+		list = []databaseItem{}
 	}
-	tmpl.ExecuteTemplate(w, "databases.html", list)
+	httpx.JSON(w, http.StatusOK, list)
 }
 
-// halaman utama satu database: daftar schema dan table
 func (h *Handler) Overview(w http.ResponseWriter, r *http.Request) {
-	p, ok := h.page(w, r)
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	name, err := db.Name(r.Context(), h.DB, id)
+	if err != nil {
+		status, msg := db.ConnectStatus(err)
+		httpx.Error(w, status, msg)
+		return
+	}
+	tx, done, ok := h.readOnly(w, r, id)
 	if !ok {
 		return
 	}
-	var schemas []schemaInfo
-	tx, done, err := h.open(r.Context(), p.ID)
-	if err == nil {
-		defer done()
-		schemas, err = listSchemas(r.Context(), tx)
-	}
-	// target mati tetap tampilin halaman, riwayat migration kan ada di database platform
+	defer done()
+	schemas, err := listSchemas(r.Context(), tx)
 	if err != nil {
-		var status int
-		status, p.Alert = db.ConnectStatus(err)
-		w.WriteHeader(status)
+		httpx.Error(w, http.StatusBadGateway, "gagal membaca schema database target")
+		return
 	}
-	tmpl.ExecuteTemplate(w, "overview.html", struct {
-		page
-		Schemas []schemaInfo
-	}{p, schemas})
+	httpx.JSON(w, http.StatusOK, struct {
+		ID      int64        `json:"id"`
+		Name    string       `json:"name"`
+		CanEdit bool         `json:"can_edit"`
+		Schemas []schemaInfo `json:"schemas"`
+	}{id, name, authorization.EffectiveFromContext(r) == authorization.ViewEdit, schemas})
 }
 
-// detail satu table: kolom, constraint, index, dan isi datanya
 func (h *Handler) Table(w http.ResponseWriter, r *http.Request) {
-	p, ok := h.page(w, r)
-	if !ok {
-		return
-	}
-	tx, done, ok := h.readOnly(w, r, p.ID)
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	tx, done, ok := h.readOnly(w, r, id)
 	if !ok {
 		return
 	}
@@ -115,61 +83,54 @@ func (h *Handler) Table(w http.ResponseWriter, r *http.Request) {
 	schema, name := r.PathValue("schema"), r.PathValue("table")
 	oid, kind, err := findTable(ctx, tx, schema, name)
 	if errors.Is(err, errNoTable) {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		httpx.Error(w, http.StatusNotFound, err.Error())
 		return
 	}
 	if err != nil {
-		http.Error(w, "gagal membaca table", http.StatusBadGateway)
+		httpx.Error(w, http.StatusBadGateway, "gagal membaca table")
 		return
 	}
 	cols, err := listColumns(ctx, tx, oid)
 	if err != nil {
-		http.Error(w, "gagal membaca kolom", http.StatusBadGateway)
+		httpx.Error(w, http.StatusBadGateway, "gagal membaca kolom")
 		return
 	}
 	cons, err := listConstraints(ctx, tx, oid)
 	if err != nil {
-		http.Error(w, "gagal membaca constraint", http.StatusBadGateway)
+		httpx.Error(w, http.StatusBadGateway, "gagal membaca constraint")
 		return
 	}
 	idx, err := listIndexes(ctx, tx, oid)
 	if err != nil {
-		http.Error(w, "gagal membaca index", http.StatusBadGateway)
+		httpx.Error(w, http.StatusBadGateway, "gagal membaca index")
 		return
 	}
 	num := parsePage(r.URL.Query().Get("page"))
-	data, err := readRows(ctx, tx, schema, name, oid, num)
+	data, hasNext, err := readRows(ctx, tx, schema, name, oid, num)
 	if err != nil {
-		http.Error(w, "gagal membaca data table", http.StatusBadGateway)
+		httpx.Error(w, http.StatusBadGateway, "gagal membaca data table")
 		return
 	}
-	tmpl.ExecuteTemplate(w, "table.html", struct {
-		page
-		Schema, Table, Kind string
-		Columns             []column
-		Constraints         []constraint
-		Indexes             []index
-		Data                tableData
-		Page                int
-	}{p, schema, name, kind, cols, cons, idx, data, num})
+	httpx.JSON(w, http.StatusOK, struct {
+		Schema      string       `json:"schema"`
+		Table       string       `json:"table"`
+		Kind        string       `json:"kind"`
+		Columns     []column     `json:"columns"`
+		Constraints []constraint `json:"constraints"`
+		Indexes     []index      `json:"indexes"`
+		Data        [][]any      `json:"data"`
+		HasNext     bool         `json:"has_next"`
+		Page        int          `json:"page"`
+	}{schema, name, kind, cols, cons, idx, data, hasNext, num})
 }
 
-// data umum buat header halaman (nama db, boleh edit atau ngga)
-func (h *Handler) page(w http.ResponseWriter, r *http.Request) (page, bool) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	name, err := db.Name(r.Context(), h.DB, id)
-	if err != nil {
-		db.ConnectError(w, err)
-		return page{}, false
-	}
-	return page{ID: id, Name: name, CanEdit: authorization.EffectiveFromContext(r) == authorization.ViewEdit}, true
-}
-
-// buka transaksi read-only ke database target, viewer ga boleh ngubah apa-apa
-func (h *Handler) open(ctx context.Context, id int64) (pgx.Tx, func(), error) {
+func (h *Handler) readOnly(w http.ResponseWriter, r *http.Request, id int64) (pgx.Tx, func(), bool) {
+	ctx := r.Context()
 	conn, err := db.Connect(ctx, h.DB, id)
 	if err != nil {
-		return nil, nil, err
+		status, msg := db.ConnectStatus(err)
+		httpx.Error(w, status, msg)
+		return nil, nil, false
 	}
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err == nil {
@@ -177,20 +138,12 @@ func (h *Handler) open(ctx context.Context, id int64) (pgx.Tx, func(), error) {
 	}
 	if err != nil {
 		conn.Close(ctx)
-		return nil, nil, db.ErrUnreachable
+		status, msg := db.ConnectStatus(db.ErrUnreachable)
+		httpx.Error(w, status, msg)
+		return nil, nil, false
 	}
 	return tx, func() {
 		tx.Rollback(ctx)
 		conn.Close(ctx)
-	}, nil
-}
-
-// sama kayak open, tapi langsung nulis response error kalau gagal
-func (h *Handler) readOnly(w http.ResponseWriter, r *http.Request, id int64) (pgx.Tx, func(), bool) {
-	tx, done, err := h.open(r.Context(), id)
-	if err != nil {
-		db.ConnectError(w, err)
-		return nil, nil, false
-	}
-	return tx, done, true
+	}, true
 }
