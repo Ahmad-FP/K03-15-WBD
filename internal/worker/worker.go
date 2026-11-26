@@ -21,6 +21,7 @@ type Worker struct {
 	Handle      Handler
 	Concurrency int           // maksimal job paralel (beda database), default 4
 	Poll        time.Duration // jeda cek antrean saat kosong, default 1 detik
+	RecoverEach time.Duration // jeda pengecekan job running yatim (worker crash), default 30 detik
 }
 
 // jalankan loop claim sampai ctx dibatalkan, lalu tunggu job yang sedang jalan selesai
@@ -32,15 +33,27 @@ func (w *Worker) Run(ctx context.Context) {
 	if poll <= 0 {
 		poll = time.Second
 	}
+	recoverEach := w.RecoverEach
+	if recoverEach <= 0 {
+		recoverEach = 30 * time.Second
+	}
 	slots := make(chan struct{}, n)
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
+	var lastRecover time.Time
 	for {
 		select {
 		case slots <- struct{}{}:
 		case <-ctx.Done():
 			return
+		}
+		// saat start dan berkala: kembalikan job yang ditinggal worker lain yang mati
+		if time.Since(lastRecover) >= recoverEach {
+			lastRecover = time.Now()
+			if _, err := Recover(ctx, w.Pool); err != nil && ctx.Err() == nil {
+				slog.ErrorContext(ctx, "worker.recover_failed", "error", err)
+			}
 		}
 		job, err := Claim(ctx, w.Pool)
 		if err != nil && ctx.Err() == nil {

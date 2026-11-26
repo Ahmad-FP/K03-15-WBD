@@ -93,7 +93,12 @@ func claimOn(ctx context.Context, conn *pgxpool.Conn) (*Job, error) {
 }
 
 // lock level session: tetap dipegang setelah transaksi claim commit, sampai unlock eksplisit
-func tryLock(ctx context.Context, tx pgx.Tx, databaseID int64) (bool, error) {
+// bisa dipanggil lewat transaksi maupun koneksi langsung
+type queryRower interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func tryLock(ctx context.Context, tx queryRower, databaseID int64) (bool, error) {
 	_, span := telemetry.Tracer().Start(ctx, "worker.lock", trace.WithAttributes(attribute.Int64("database.id", databaseID)))
 	defer span.End()
 	var ok bool
